@@ -10,11 +10,14 @@ Features
 - ✅ Popup dialog & Toast notification                       内置 Popup dialog & Toast 组件
 - ✅ Abstract render layer (easy to replace renderer)        抽象渲染层, 可轻易替换实现
 - ✅ Unified mouse/touch event system
+
 Quick Start
+
 Install pygame
 ```bash
 pip install pygame
 ```
+
 Run main script directly
 ```bash
 python main.py
