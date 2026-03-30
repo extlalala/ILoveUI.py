@@ -926,16 +926,21 @@ class Popup:
 class PopupManager:
     def __init__(self) -> None:
         self.popups: list[Popup] = []
+        self.enabled = True
 
     def add(self, popup_content: Callable[[ILoveUI, PopupContext], Any]) -> None:
         self.popups.append(Popup(popup_content))
 
-def popup_layer(u: ILoveUI) -> Modifying:
+def popup_layer(u: ILoveUI) -> None:
     '''
     在 ui 最上层的第一行调用
     '''
+    popupManager = u.context.remember(PopupManager, PopupManager)
+
+    if not popupManager.enabled:
+        return
+
     def box_content(u: ILoveUI):
-        popupManager = u.context.remember(PopupManager, PopupManager)
         to_top_popups: list[Popup] = []
 
         for i in range(len(popupManager.popups) - 1, -1, -1):
@@ -954,7 +959,7 @@ def popup_layer(u: ILoveUI) -> Modifying:
 
         popupManager.popups += to_top_popups
 
-    return box(u, box_content)
+    box(u, box_content)
 
 
 def popup_content(u: ILoveUI) -> Callable[[Callable[[ILoveUI, PopupContext], None]], None]:
@@ -1053,10 +1058,11 @@ def window_content(
     u: ILoveUI,
     initial_x: float = 100,
     initial_y: float = 200,
-    layout: Callable[[ILoveUI, Callable[[ILoveUI], None]], Modifying] | None = None
+    layout: Callable[[ILoveUI, Callable[[ILoveUI], None]], Modifying] | None = None,
+    with_close_button: bool = True
 ) -> Callable[[Callable[[ILoveUI, PopupContext], None]], None]:
     def decorator(content: Callable[[ILoveUI, PopupContext], None]) -> None:
-        window(u, content, initial_x, initial_y, layout)
+        window(u, content, initial_x, initial_y, layout, with_close_button)
     return decorator
 
 WINDOW_FRAME_SIZE = 14
@@ -1066,7 +1072,8 @@ def window(
     content: Callable[[ILoveUI, PopupContext], None],
     initial_x: float = 100,
     initial_y: float = 200,
-    layout: Callable[[ILoveUI, Callable[[ILoveUI], None]], Modifying] | None = None
+    layout: Callable[[ILoveUI, Callable[[ILoveUI], None]], Modifying] | None = None,
+    with_close_button: bool = True
 ) -> None:
     if layout is None:
         layout = box
@@ -1104,9 +1111,15 @@ def window(
 
         return Placeable(p.min_width, p.min_height, place_fn)
 
+    if with_close_button:
+        old_content = content
+        def wrapped_content(u: ILoveUI, ctx: PopupContext) -> None:
+            window_close_button(u, ctx.close)
+            old_content(u, ctx)
+        content = wrapped_content
+
     @popup_content(u)
     def window_popup(u: ILoveUI, ctx: PopupContext) -> None:
-
         content_ui = layout(u, lambda u: content(u, ctx))
 
         content_ui \
@@ -1663,12 +1676,15 @@ def render_time_text(u: ILoveUI, id: UIPath) -> Modifying:
 def bitmap_ui(
     u: ILoveUI, id: UIPath,
     bitmap: bytearray,
+    total_bytes_count: int = -1,
     flip_byte_at: Callable[[int], None] | None = None,
     row_byte_count: int = 8
 ) -> Modifying:
     '''
     用 byte 表示 bool
     '''
+    if total_bytes_count < 0:
+        total_bytes_count = len(bitmap)
 
     def flip_index(index: int) -> None:
         if flip_byte_at is None:
@@ -1684,28 +1700,68 @@ def bitmap_ui(
 
     @column_content(u)
     def byte_rows_col(u: ILoveUI):
-        total_bytes = len(bitmap)
-
-        for row_number in range((total_bytes + row_byte_count - 1) // row_byte_count):
+        for row_number in range((total_bytes_count + row_byte_count - 1) // row_byte_count):
             row_start_index = row_number * row_byte_count
 
             @row_content(u)
             def bytes_row(u: ILoveUI):
+                text(u, str(row_start_index), id / row_start_index) \
+                    .min_size_xy(40, 0)
+
                 for col_number in range(row_byte_count):
                     index = row_start_index + col_number
 
-                    if index >= total_bytes:
+                    if index >= total_bytes_count:
                         spacing(u).flex() # 代替缺失的位参与布局, 保持最后一行布局正常
                         continue
 
                     byte_ui(u, index)
 
+                def flip_row(_, row_start_index = row_start_index):
+                    for col_number in range(row_byte_count):
+                        index = row_start_index + col_number
+                        if index < total_bytes_count:
+                            flip_index(index)
+
+                text(u, 'flip', id / 'flip' / row_start_index) \
+                    .min_size_xy(40, 0) \
+                    .clickable(highlight, flip_row)
+
             bytes_row \
                 .ratio_expend(row_byte_count, 1) \
-                .tag(u, str(row_start_index), id / row_start_index, min_size=40, with_spacing=False)
 
     return byte_rows_col \
         .v_scroll(id / 'scroll')
+
+def single_component_rgba_color_selector(u: ILoveUI, component_ref: Ref[int]) -> Modifying:
+    return slider(u, Ref(component_ref.get, lambda value: component_ref.set(int(value))), 0, 255)
+
+def rgba_color_selector(u: ILoveUI, color_ref: Ref[Color]) -> Modifying:
+    @row_content(u)
+    def top_row(u: ILoveUI):
+
+        @column_content(u)
+        def rgba_sliders_col(u: ILoveUI):
+            # single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.r, lambda value: color_ref.set(dataclasses.replace(color_ref.value, r=value)))).flex()
+            # single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.g, lambda value: color_ref.set(dataclasses.replace(color_ref.value, g=value)))).flex()
+            # single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.b, lambda value: color_ref.set(dataclasses.replace(color_ref.value, b=value)))).flex()
+            # single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.a, lambda value: color_ref.set(dataclasses.replace(color_ref.value, a=value)))).flex()
+
+            c = color_ref.value
+            single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.r, lambda value: color_ref.set(Color(value, c.g, c.b, c.a)))).flex()
+            single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.g, lambda value: color_ref.set(Color(c.r, value, c.b, c.a)))).flex()
+            single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.b, lambda value: color_ref.set(Color(c.r, c.g, value, c.a)))).flex()
+            single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.a, lambda value: color_ref.set(Color(c.r, c.g, c.b, value)))).flex()
+
+        rgba_sliders_col.flex(4)
+
+        spacing(u) \
+            .background(color_ref.value) \
+            .flex()
+
+    return top_row \
+        .min_size_xy(40, 0) \
+        .ratio_expend(5, 1)
 
 # ==================== renderer ====================
 
@@ -1826,41 +1882,115 @@ class RenderLayerMode(Enum):
     exactly = auto()
     before = auto()
     after = auto()
+    mask = auto()
 
     def next_mode(self) -> 'RenderLayerMode':
-        match self:
+        members = list(RenderLayerMode)
+        current_index = members.index(self)
+        next_index = (current_index + 1) % len(members)
+        return members[next_index]
+
+@dataclass(slots=True)
+class RenderLayerManager:
+    layer: int = 10
+    render_mode: RenderLayerMode = RenderLayerMode.all
+    render_mask: bytearray = field(default_factory=lambda: bytearray(512))
+    id: UIPath = field(default_factory=UIPath.root)
+
+    def get_mask(self, required_count: int) -> bytearray:
+        current_size = len(self.render_mask)
+        if current_size >= required_count:
+            return self.render_mask
+
+        bytes_extend = b'\x00' * (required_count - current_size)
+        self.render_mask.extend(bytes_extend)
+        return self.render_mask
+
+    def render_mode_to_list_mapper(self) -> Callable[[list[RenderOperate]], list[RenderOperate]]:
+        match self.render_mode:
             case RenderLayerMode.all:
-                return RenderLayerMode.exactly
+                return lambda x: x
             case RenderLayerMode.exactly:
-                return RenderLayerMode.before
+                def exactly_mapper(lst: list[RenderOperate]) -> list[RenderOperate]:
+                    if self.layer not in range(len(lst)):
+                        return []
+                    op = lst[self.layer]
+                    if op.type == RenderOperateType.scissor_op:
+                        return []
+                    return [op]
+                return exactly_mapper
+
             case RenderLayerMode.before:
-                return RenderLayerMode.after
+                def before_mapper(lst: list[RenderOperate]) -> list[RenderOperate]:
+                    return [e for i, e in enumerate(lst) if i <= self.layer or e.type == RenderOperateType.scissor_op]
+                return before_mapper
+
             case RenderLayerMode.after:
-                return RenderLayerMode.all
+                def after_mapper(lst: list[RenderOperate]) -> list[RenderOperate]:
+                    return [e for i, e in enumerate(lst) if i >= self.layer or e.type == RenderOperateType.scissor_op]
+                return after_mapper
+
+            case RenderLayerMode.mask:
+                def after_mapper(lst: list[RenderOperate]) -> list[RenderOperate]:
+                    mask = self.get_mask(len(lst))
+                    return [e for i, e in enumerate(lst) if mask[i] != 0 or e.type == RenderOperateType.scissor_op]
+                return after_mapper
+
             case _:
-                raise ValueError(self)
+                raise ValueError('unreachable')
 
-def render_layer_control_ui(u: ILoveUI, max_layer: int, layer: Ref[int], mode: Ref[RenderLayerMode]) -> Modifying:
-    @row_content(u)
-    def top_row(u: ILoveUI):
-        text(u, '<') \
-            .square_expend() \
-            .clickable(highlight, lambda _: layer.set(layer.value - 1))
+def render_layer_control_ui(u: ILoveUI, max_layer: int, state: RenderLayerManager) -> Modifying:
+    layer = state.layer
 
-        slider(u, Ref(layer.get, lambda value: layer.set(round(value))), 0, max_layer, check_scissor_rect=False) \
-            .flex() \
-            .tag(u, f'layer: {layer.value}  ', with_spacing=False, min_size=120) \
-            .tag_right(u, f'  max: {max_layer}', min_size=120)
+    def set_layer(value: int) -> None:
+        nonlocal layer
+        layer = value
+        state.layer = value
 
-        text(u, '>') \
-            .square_expend() \
-            .clickable(highlight, lambda _: layer.set(layer.value + 1))
+    @column_content(u)
+    def top_col(u: ILoveUI):
 
-        text(u, mode.value.name) \
-            .min_size_xy(80, 0) \
-            .clickable(highlight, lambda _: mode.set(mode.value.next_mode()), check_scissor_rect=False)
+        spacing(u, 20, 20)
 
-    return top_row
+        @row_content(u)
+        def slider_row(u: ILoveUI):
+            text(u, '<') \
+                .square_expend() \
+                .clickable(highlight, lambda _: set_layer(layer - 1))
+
+            slider(u, Ref(lambda: layer, lambda value: set_layer(round(value))), 0, max_layer, check_scissor_rect=False) \
+                .flex() \
+                .tag(u, f'layer: {layer}  ', with_spacing=False, min_size=100) \
+                .tag_right(u, f'  max: {max_layer}', min_size=100) \
+                .min_size_xy(280, 0)
+
+            text(u, '>') \
+                .square_expend() \
+                .clickable(highlight, lambda _: set_layer(layer + 1))
+
+        @row_content(u)
+        def buttons_row(u: ILoveUI):
+
+            def toggle_mode(_) -> None:
+                state.render_mode = state.render_mode.next_mode()
+
+            text(u, state.render_mode.name) \
+                .flex() \
+                .clickable(highlight, toggle_mode, check_scissor_rect=False)
+
+            def flip_mask(_):
+                for i, e in enumerate(state.render_mask):
+                    state.render_mask[i] = 0 if e != 0 else 1
+
+            text(u, 'flip mask') \
+                .flex() \
+                .clickable(highlight, flip_mask, check_scissor_rect=False)
+
+        bitmap_ui(u, state.id / 'bitmap_ui', state.render_mask, total_bytes_count=max_layer) \
+            .flex(1)
+
+    return top_col \
+        .square_expend()
 
 @dataclass(slots=True)
 class UIRendererUIState:
@@ -1906,32 +2036,6 @@ def ui_renderer_ui(
 
     return u.element(place_fn)
 
-def render_mode_to_list_mapper(layer: int, mode: RenderLayerMode) -> Callable[[list[RenderOperate]], list[RenderOperate]]:
-    match mode:
-        case RenderLayerMode.all:
-            return lambda x: x
-        case RenderLayerMode.exactly:
-            def exactly_mapper(lst: list[RenderOperate]) -> list[RenderOperate]:
-                if layer not in range(len(lst)):
-                    return []
-                op = lst[layer]
-                if op.type == RenderOperateType.scissor_op:
-                    return []
-                return [op]
-            return exactly_mapper
-
-        case RenderLayerMode.before:
-            def before_mapper(lst: list[RenderOperate]) -> list[RenderOperate]:
-                return [e for i, e in enumerate(lst) if i <= layer or e.type == RenderOperateType.scissor_op]
-            return before_mapper
-
-        case RenderLayerMode.after:
-            def after_mapper(lst: list[RenderOperate]) -> list[RenderOperate]:
-                return [e for i, e in enumerate(lst) if i >= layer or e.type == RenderOperateType.scissor_op]
-            return after_mapper
-
-        case _:
-            raise ValueError('unreachable')
 
 def debug_ui_rect_control_ui(u: ILoveUI, ui_rect_ref: Ref[Rect | None], show_rect_ref: Ref[bool]) -> Modifying:
     @row_content(u)
@@ -1966,14 +2070,14 @@ class FastStartContext:
     fps: float
 
 def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
-    layer = Ref.new_box(10)
-    render_mode = Ref.new_box(RenderLayerMode.all)
+    render_layer_manager = RenderLayerManager()
     ui_renderer_ui_state = UIRendererUIState()
+    color_ref = Ref.new_box(Color(0, 0, 0, 255))
 
     ui_rect: Rect | None = None
     show_rect: bool = True
-    close_last_ui_rect_control_window: Callable[[], None] | None = None
 
+    close_last_ui_rect_control_window: Callable[[], None] | None = None
     def open_ui_rect_control_window(u: ILoveUI):
         if close_last_ui_rect_control_window is not None:
             close_last_ui_rect_control_window()
@@ -1983,8 +2087,6 @@ def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
             nonlocal close_last_ui_rect_control_window
             close_last_ui_rect_control_window = ctx.close
 
-            window_close_button(u, ctx.close)
-
             def set_rect(value: Rect | None) -> None:
                 nonlocal ui_rect
                 ui_rect = value
@@ -1993,12 +2095,44 @@ def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
                 show_rect = value
             debug_ui_rect_control_ui(u, Ref(lambda: ui_rect, set_rect), Ref(lambda: show_rect, set_show_rect))
 
+    close_last_color_selector_window: Callable[[], None] | None = None
+    def open_color_selector_window(u: ILoveUI):
+        if close_last_color_selector_window is not None:
+            close_last_color_selector_window()
+
+        @window_content(u)
+        def color_selector_window(u: ILoveUI, ctx: PopupContext):
+            nonlocal close_last_color_selector_window
+            close_last_color_selector_window = ctx.close
+
+            rgba_color_selector(u, color_ref)
+
+    close_last_render_layer_window: Callable[[], None] | None = None
+    def open_render_layer_window(u: ILoveUI):
+        if close_last_render_layer_window is not None:
+            close_last_render_layer_window()
+
+        @window_content(u)
+        def render_layer_window(u: ILoveUI, ctx: PopupContext):
+            nonlocal close_last_render_layer_window
+            close_last_render_layer_window = ctx.close
+
+            max_layer = len(ui_renderer_ui_state.cached_render_tick_listeners) if ui_renderer_ui_state.cached_render_tick_listeners is not None else 0
+
+            render_layer_control_ui(u, max_layer, render_layer_manager)
+
     def fast_debug_ui(u: ILoveUI, ctx: FastStartContext) -> None:
         # todo 随意调节窗口大小 [v]
         # todo 暂停, 逐帧推进 [v]
         # todo 拦截所有事件并提供虚拟手指, 可以精确操控
         # todo 逐层渲染 [v]
         # todo 渲染剪刀区域
+
+        popup_manager = u.context.remember(PopupManager, PopupManager)
+
+        popup_manager.enabled = True
+        popup_layer(u)
+        popup_manager.enabled = False
 
         if show_rect and ui_rect is not None:
             spacing(u) \
@@ -2008,19 +2142,23 @@ def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
         @column_content(u)
         def top_column(u: ILoveUI):
 
-            ui_renderer_ui(u, ui_renderer_ui_state, lambda u: ui(u, ctx), map_render_tick_listeners=render_mode_to_list_mapper(layer.value, render_mode.value), rect=ui_rect) \
+            ui_renderer_ui(u, ui_renderer_ui_state, lambda u: ui(u, ctx), map_render_tick_listeners=render_layer_manager.render_mode_to_list_mapper(), rect=ui_rect) \
                 .flex() \
                 .scissor()
 
             @row_content(u)
             def control_row(u: ILoveUI):
-                text(u, 'rect') \
+                text(u, 'ui rect') \
                     .flex() \
                     .clickable(highlight, lambda _: open_ui_rect_control_window(u), check_scissor_rect=False)
 
-                text(u, f'scissors {u.context.renderer.get_scissor_count()}') \
+                text(u, 'bg color') \
                     .flex() \
-                    .clickable(highlight, lambda _: toast(u, 'test'), check_scissor_rect=False)
+                    .clickable(highlight, lambda _: open_color_selector_window(u), check_scissor_rect=False)
+
+                text(u, 'layer') \
+                    .flex() \
+                    .clickable(highlight, lambda _: open_render_layer_window(u), check_scissor_rect=False)
 
                 text(u, 'single step' if ui_renderer_ui_state.single_step_mode else 'run') \
                     .flex() \
@@ -2030,10 +2168,8 @@ def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
                     .flex() \
                     .clickable(highlight, lambda _: ui_renderer_ui_state.toggle_step(), check_scissor_rect=False)
 
-                max_layer = len(ui_renderer_ui_state.cached_render_tick_listeners) if ui_renderer_ui_state.cached_render_tick_listeners is not None else 0
-
-                render_layer_control_ui(u, max_layer, layer, render_mode) \
-                    .flex(6)
+        spacing(u) \
+            .background(color_ref.value)
 
     fast_start(fast_debug_ui)
 
@@ -2196,7 +2332,7 @@ def open_window_button(u: ILoveUI, id: UIPath) -> Modifying:
 
         random_offset = 40
         r = rect_ref.value
-        @window_content(u, initial_x=r.center_x + random.random() * random_offset, initial_y=r.y + r.h + 40 + random.random() * random_offset)
+        @window_content(u, initial_x=r.center_x + random.random() * random_offset, initial_y=r.y + r.h + 40 + random.random() * random_offset, with_close_button=False)
         def window_test(u: ILoveUI, ctx: PopupContext):
             def close_window():
                 toast(u, 'window closing')
