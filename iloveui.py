@@ -6,7 +6,8 @@ import time
 from abc import ABC, abstractmethod
 from asyncio import CancelledError
 from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine, Generic, Hashable, Self, TypeVar
+from enum import auto, Enum
+from typing import Any, Callable, Coroutine, Generic, Hashable, Literal, Self, TypeVar
 
 T = TypeVar('T')
 
@@ -65,7 +66,13 @@ class UIPath:
         '''
         return UIPath((*self.path_tuple, key), self.state_by_path)
 
-    def remember(self, calc: Callable[[], T], valid_key: Any = None, on_discard: Callable[[T], None] | None = None) -> T:
+    def remember(
+        self,
+        calc: Callable[[], T],
+        valid_key: Any = None,
+        on_discard: Callable[[T], None] | None = None,
+        need_to_discard: Callable[[T], bool] | None = None,
+    ) -> T:
         '''
         当 valid_key 变化时重算
         '''
@@ -81,7 +88,9 @@ class UIPath:
         if entry is None:
             return calc_value()
 
-        if entry.valid_key != valid_key:
+        if (entry.valid_key != valid_key or
+            (need_to_discard is not None and need_to_discard(entry.state_value))):
+
             if on_discard is not None:
                 on_discard(entry.state_value)
 
@@ -134,6 +143,10 @@ class Finger:
     drag_listener: Callable[['Finger'], Any] | None = None
     release_listener: Callable[['Finger'], Any] | None = None
 
+    def in_rect(self, ctx: 'PlaceContext', check_scissor_rect: bool) -> bool:
+        return ((not check_scissor_rect or ctx.context.renderer.contains_point(self.x, self.y)) and
+                ctx.rect.contains_point(self.x, self.y))
+
 @dataclass(slots=True)
 class NewFingerEvent:
     finger: Finger
@@ -151,6 +164,10 @@ class ScrollEvent:
     mouse_y: float
     scroll_x: float
     scroll_y: float
+
+    def in_rect(self, ctx: 'PlaceContext', check_scissor_rect: bool) -> bool:
+        return ((not check_scissor_rect or ctx.context.renderer.contains_point(self.mouse_x, self.mouse_y)) and
+                ctx.rect.contains_point(self.mouse_x, self.mouse_y))
 
 # ==================== core ====================
 
@@ -231,23 +248,34 @@ class Rect:
                 self.y <= py <= self.y + self.h)
 
 class Renderer(ABC):
+    def contains_point(self, x: float, y: float) -> bool:
+        scissor = self.scissor_rect
+        return scissor is None or scissor.contains_point(x, y)
+
     @abstractmethod
-    def push_scissor(self, rect: Rect) -> None: ...
+    def push_scissor(self, rect: Rect, for_render: bool = True) -> None: ...
 
     @abstractmethod
     def pop_scissor(self) -> None: ...
+
+    @property
+    def scissor_rect(self) -> Rect | None: ...
+
+    @abstractmethod
+    def get_scissor_count(self) -> int: ...
 
     @abstractmethod
     def fill_rect(self, rect: Rect, color: Color, line_width: float = 0) -> None: ...
 
     @dataclass
-    class TextRenderer:
+    class Renderable:
         min_width: float
         min_height: float
         render: Callable[[Rect], None]
+        can_render: Callable[[Rect], bool] = field(default=lambda _: True)
 
     @abstractmethod
-    def draw_text(self, text_str: str, color: Color = Color(255, 255, 255)) -> TextRenderer: ...
+    def draw_text(self, text_str: str, color: Color = Color(255, 255, 255)) -> Renderable: ...
 
     @abstractmethod
     def draw_line(
@@ -267,11 +295,23 @@ class Renderer(ABC):
         color: Color,
     ) -> None: ...
 
+class RenderOperateType(Enum):
+    scissor_op = auto()
+    do_render = auto()
+
+@dataclass(slots=True)
+class RenderOperate:
+    type: RenderOperateType
+    operate_fn: Callable[[], None]
+
 @dataclass(slots=True)
 class PlaceContext:
     rect: Rect
     context: 'ILoveUIContext'
-    deferred_render_tick: Callable[[Callable[[], None]], None] # = render_tick_listeners.append, render_tick_listeners is list
+    deferred_render_tick_listeners: list[RenderOperate]
+
+    def deferred_render_tick(self, operate_fn: Callable[[], None], type: RenderOperateType = RenderOperateType.do_render) -> None:
+        self.deferred_render_tick_listeners.append(RenderOperate(type, operate_fn))
 
 @dataclass(slots=True)
 class Placeable:
@@ -329,14 +369,14 @@ class Modifying:
         '''
         p = self.placeable
         def place_fn(ctx: PlaceContext):
-            p.place_fn(PlaceContext(rect, ctx.context, ctx.deferred_render_tick))
+            p.place_fn(PlaceContext(rect, ctx.context, ctx.deferred_render_tick_listeners))
         self.placeable = Placeable(component_min_width, component_min_height, place_fn)
         return self
 
     def map_rect(self, mapper: Callable[[Rect], Rect], component_min_width: float = 10, component_min_height: float = 10) -> Self:
         p = self.placeable
         def place_fn(ctx: PlaceContext):
-            p.place_fn(PlaceContext(mapper(ctx.rect), ctx.context, ctx.deferred_render_tick))
+            p.place_fn(PlaceContext(mapper(ctx.rect), ctx.context, ctx.deferred_render_tick_listeners))
         self.placeable = Placeable(component_min_width, component_min_height, place_fn)
         return self
 
@@ -357,22 +397,22 @@ class Modifying:
             p.place_fn(ctx)
 
             if not touch_through:
-                ctx.context.event_manager.consume_events(NewFingerEvent, lambda e: ctx.rect.contains_point(e.finger.x, e.finger.y))
+                ctx.context.event_manager.consume_events(NewFingerEvent, lambda e: e.finger.in_rect(ctx, True))
 
             ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, color))
 
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
-    def clickable(self, hover_color: Color | None, click_callback: Callable[[Finger], None]) -> Self:
+    def clickable(self, hover_color: Color | None, click_callback: Callable[[Finger], None], check_scissor_rect: bool = True) -> Self:
         p = self.placeable
         def place_fn(ctx: PlaceContext):
             def consume_new_finger_event(e: NewFingerEvent) -> bool:
-                in_rect = ctx.rect.contains_point(e.finger.x, e.finger.y)
+                in_rect = e.finger.in_rect(ctx, check_scissor_rect)
 
                 if in_rect:
                     def finger_release_listener(finger):
-                        if ctx.rect.contains_point(finger.x, finger.y):
+                        if e.finger.in_rect(ctx, check_scissor_rect):
                             click_callback(finger)
 
                     e.finger.release_listener = finger_release_listener
@@ -381,7 +421,7 @@ class Modifying:
 
             ctx.context.event_manager.consume_events(NewFingerEvent, consume_new_finger_event)
 
-            if hover_color is not None and any(ctx.rect.contains_point(finger.x, finger.y) for finger in ctx.context.fingers):
+            if hover_color is not None and any(finger.in_rect(ctx, check_scissor_rect) for finger in ctx.context.fingers):
                 ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, hover_color)) # type: ignore
 
             p.place_fn(ctx)
@@ -389,7 +429,7 @@ class Modifying:
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
-    def clickable_background(self, background_color: Color | None, click_callback: Callable[[Finger], None]) -> Self:
+    def clickable_background(self, background_color: Color | None, click_callback: Callable[[Finger], None], check_scissor_rect: bool = True) -> Self:
         '''
         用于拦截落在背景而不是 ui 内容的点击,
         可以用来实现点击背景取消弹窗的效果
@@ -399,11 +439,11 @@ class Modifying:
             p.place_fn(ctx)
 
             def consume_new_finger_event(e: NewFingerEvent) -> bool:
-                in_rect = ctx.rect.contains_point(e.finger.x, e.finger.y)
+                in_rect = e.finger.in_rect(ctx, check_scissor_rect)
 
                 if in_rect:
                     def release_listener(finger):
-                        if ctx.rect.contains_point(finger.x, finger.y):
+                        if e.finger.in_rect(ctx, check_scissor_rect):
                             click_callback(finger)
                     e.finger.release_listener = release_listener
 
@@ -417,11 +457,11 @@ class Modifying:
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
-    def on_touchdown(self, touchdown_callback: Callable[[Finger], None], consume_event: bool = False) -> Self:
+    def on_touchdown(self, touchdown_callback: Callable[[Finger], None], consume_event: bool = False, check_scissor_rect: bool = True) -> Self:
         p = self.placeable
         def place_fn(ctx: PlaceContext):
             def consume_new_finger_event(e: NewFingerEvent) -> bool:
-                in_rect = ctx.rect.contains_point(e.finger.x, e.finger.y)
+                in_rect = e.finger.in_rect(ctx, check_scissor_rect)
                 if in_rect:
                     touchdown_callback(e.finger)
 
@@ -433,13 +473,26 @@ class Modifying:
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
-    def tag(self, u: 'ILoveUI', tag_str: str, id: UIPath | None = None) -> Self:
+    def tag(self, u: 'ILoveUI', tag_str: str, id: UIPath | None = None, with_spacing: bool = True, min_size: float = 0) -> Self:
         p = self.placeable
 
         def row_content(u: ILoveUI):
-            tag_ui = text(u, tag_str, id / 'tag_ui' if id is not None else None)
+            tag_ui = text(u, tag_str, id / 'tag_ui' if id is not None else None) \
+                .min_size_xy(min_size, 0)
             u.element_placeable(p).flex()
-            spacing_copy_size(u, tag_ui) # 为了居中
+            if with_spacing:
+                spacing_copy_size(u, tag_ui) # 为了居中
+
+        self.placeable = u.context.to_placeable(row_content, row)
+        return self
+
+    def tag_right(self, u: 'ILoveUI', tag_str: str, id: UIPath | None = None, min_size: float = 0) -> Self:
+        p = self.placeable
+
+        def row_content(u: ILoveUI):
+            u.element_placeable(p).flex()
+            text(u, tag_str, id / 'tag_ui' if id is not None else None) \
+                .min_size_xy(min_size, 0)
 
         self.placeable = u.context.to_placeable(row_content, row)
         return self
@@ -482,7 +535,7 @@ class Modifying:
                 new_rect = Rect(mix(lr.x, cr.x), mix(lr.y, cr.y), mix(lr.w, cr.w), mix(lr.h, cr.h))
                 last_rect.value = new_rect
 
-            p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick))
+            p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
 
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
@@ -493,6 +546,12 @@ class Modifying:
         '''
         p = self.placeable
         self.placeable = Placeable(p.min_width + expend_x, p.min_height + expend_y, p.place_fn)
+        return self
+
+    def min_size_xy(self, min_w: float, min_h: float) -> Self:
+        p = self.placeable
+        if min_w > p.min_width or min_h > p.min_height:
+            self.placeable = Placeable(max(p.min_width, min_w), max(p.min_height, min_h), p.place_fn)
         return self
 
     def ratio_expend(self, ratio_x: int, ratio_y: int) -> Self:
@@ -507,7 +566,7 @@ class Modifying:
         p = self.placeable
         def place_fn(ctx: PlaceContext):
             new_rect = ctx.rect.with_padding(padding_x, padding_y)
-            p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick))
+            p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
         self.placeable = Placeable(p.min_width + 2 * padding_x, p.min_height + 2 * padding_y, place_fn)
         return self
 
@@ -520,7 +579,7 @@ class Modifying:
                 align_x if align_x is not None else 0,
                 align_y if align_y is not None else 0
             )
-            p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick))
+            p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
@@ -533,7 +592,7 @@ class Modifying:
                 offset_x if offset_x is not None else 0,
                 offset_y if offset_y is not None else 0
             )
-            p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick))
+            p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
@@ -584,6 +643,7 @@ def scroll_modifier(
     friction: float = 0.92,
     mouse_wheel_speed: float = -10,
     scissor: bool = True,
+    check_scissor_rect: bool = True
 ) -> Placeable:
     state = id.remember(ScrollState)
 
@@ -610,7 +670,7 @@ def scroll_modifier(
                 state.velocity = 0
 
         def consume_scroll_event(e: ScrollEvent) -> bool:
-            in_rect = ctx.rect.contains_point(e.mouse_x, e.mouse_y)
+            in_rect = e.in_rect(ctx, check_scissor_rect)
             if not in_rect:
                 return False
 
@@ -624,7 +684,8 @@ def scroll_modifier(
         ctx.context.event_manager.consume_events(ScrollEvent, consume_scroll_event)
 
         if scissor:
-            ctx.deferred_render_tick(lambda: ctx.context.renderer.pop_scissor()) # defer 从下到上执行
+            ctx.context.renderer.push_scissor(ctx.rect, for_render=False) # 用于拦截事件
+            ctx.deferred_render_tick(lambda: ctx.context.renderer.pop_scissor(), RenderOperateType.scissor_op) # defer 从下到上执行
 
         if horizontal:
             content_rect = Rect(
@@ -640,15 +701,16 @@ def scroll_modifier(
                 ctx.rect.w,
                 total_content_size,
             )
-        child_ctx = PlaceContext(content_rect, ctx.context, ctx.deferred_render_tick)
+        child_ctx = PlaceContext(content_rect, ctx.context, ctx.deferred_render_tick_listeners)
         element_ui.place_fn(child_ctx)
 
         if scissor:
-            ctx.deferred_render_tick(lambda: ctx.context.renderer.push_scissor(ctx.rect)) # defer 从下到上执行
+            ctx.context.renderer.pop_scissor() # 用于拦截事件
+            ctx.deferred_render_tick(lambda: ctx.context.renderer.push_scissor(ctx.rect), RenderOperateType.scissor_op) # defer 从下到上执行
 
         #拖拽
         def consume_finger(e: NewFingerEvent) -> bool:
-            in_rect = ctx.rect.contains_point(e.finger.x, e.finger.y)
+            in_rect = e.finger.in_rect(ctx, check_scissor_rect)
             if not in_rect:
                 return False
 
@@ -696,6 +758,14 @@ class EventManager:
     def send_event(self, type: type[T], e: T) -> None:
         self.new_events.append((type, e))
 
+    def send_event_instantly(self, type: type[T], e: T) -> None:
+        events = self.event_by_type.get(type)
+        if events is None:
+            events = []
+            self.event_by_type[type] = events
+
+        events.append(e)
+
     def consume_events(self, type: type[T], consume: Callable[[T], bool]) -> None:
         events = self.event_by_type.get(type)
         if events is None:
@@ -738,13 +808,13 @@ class ILoveUIContext:
         return self.type_value_map.remember(cls_as_key, calc)
 
     def place_in(self, rect: Rect, place_fn: Callable[[PlaceContext], None]) -> None:
-        render_tick_listeners: list[Callable[[], None]] = []
+        render_tick_listeners: list[RenderOperate] = []
 
-        place_ctx = PlaceContext(rect, self, render_tick_listeners.append)
+        place_ctx = PlaceContext(rect, self, render_tick_listeners)
         place_fn(place_ctx)
 
-        for listener in reversed(render_tick_listeners):
-            listener()
+        for operate in reversed(render_tick_listeners):
+            operate.operate_fn()
 
     def to_placeable(
         self,
@@ -965,7 +1035,7 @@ def window(
             p.place_fn(ctx)
 
             def consume_new_finger_events(e: NewFingerEvent) -> bool:
-                in_rect = ctx.rect.contains_point(e.finger.x, e.finger.y)
+                in_rect = e.finger.in_rect(ctx, True)
 
                 offset_x = e.finger.x - ctx.rect.x
                 offset_y = e.finger.y - ctx.rect.y
@@ -1045,20 +1115,20 @@ def memo(
         state.valid_key = valid_key
 
     def place_fn(ctx: PlaceContext):
-        def place_component() -> list[Callable[[], None]]:
-            render_tick_listeners: list[Callable[[], None]] = []
+        def place_component() -> list[RenderOperate]:
+            render_tick_listeners: list[RenderOperate] = []
 
             # 确保每次 place_component 都对应一次 layout_component
             if not state.new_memo:
                 state.memo_placeable = layout_component()
 
             state.new_memo = False
-            state.memo_placeable.place_fn(PlaceContext(ctx.rect, ctx.context, render_tick_listeners.append))
+            state.memo_placeable.place_fn(PlaceContext(ctx.rect, ctx.context, render_tick_listeners))
             return render_tick_listeners
 
         render_tick_listeners = (id / 'render_tick_listeners').remember(place_component, (ctx.rect, valid_key))
-        for listener in render_tick_listeners:
-            ctx.deferred_render_tick(listener)
+
+        ctx.deferred_render_tick_listeners += render_tick_listeners
 
     return u.element(place_fn, state.memo_placeable.min_width, state.memo_placeable.min_height)
 
@@ -1207,7 +1277,7 @@ def linear(u: ILoveUI, horizontal: bool, spacing: float, content: Callable[[ILov
                 child_size = ui.flex_weight * weight_to_flex_size_factor
 
             child_rect = Rect(base, ctx.rect.y, child_size, ctx.rect.h) if horizontal else Rect(ctx.rect.x, base, ctx.rect.w, child_size)
-            child_ctx = PlaceContext(child_rect, ctx.context, ctx.deferred_render_tick)
+            child_ctx = PlaceContext(child_rect, ctx.context, ctx.deferred_render_tick_listeners)
             ui.placeable.place_fn(child_ctx)
             base += child_size + spacing
 
@@ -1250,7 +1320,7 @@ class TextFieldState:
         self.last_blink = time.time()
         self.blink_state = True
 
-def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "type something...") -> Modifying:
+def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "type something...", check_scissor_rect: bool = True) -> Modifying:
     focus_manager = u.context.remember(FocusManager, FocusManager)
 
     def add_invisible_unfocus_click_layer():
@@ -1274,7 +1344,7 @@ def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "t
         active = (focus_manager.focused_ui_path == id)
 
         def consume_new_finger_event(e: NewFingerEvent) -> bool:
-            in_rect = ctx.rect.contains_point(e.finger.x, e.finger.y)
+            in_rect = e.finger.in_rect(ctx, check_scissor_rect)
             if in_rect and focus_manager.focused_ui_path != id:
                 focus_manager.focused_ui_path = id
                 add_invisible_unfocus_click_layer()
@@ -1329,10 +1399,10 @@ def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "t
 
     return u.element(place_fn, min_w, min_h)
 
-def slider(u: ILoveUI, value_ref: Ref[float], min_val: float, max_val: float) -> Modifying:
+def slider(u: ILoveUI, value_ref: Ref[float], min_val: float, max_val: float, check_scissor_rect: bool = True) -> Modifying:
     def place_fn(ctx: PlaceContext):
         def consume_new_finger_event(e: NewFingerEvent) -> bool:
-            in_rect = ctx.rect.contains_point(e.finger.x, e.finger.y)
+            in_rect = e.finger.in_rect(ctx, check_scissor_rect)
 
             def handle_finger(finger):
                 t = max(0.0, min(1.0, (finger.x - ctx.rect.x) / ctx.rect.w))
@@ -1399,7 +1469,7 @@ def default_touchpad_handle(u: ILoveUI) -> Modifying:
     return text(u, 'O') \
         .background(Color(180, 20, 20)) \
 
-def touchpad(u: ILoveUI, touchpad_vec: Ref[tuple[float, float]], touchpad_handle: Callable[[ILoveUI], Modifying] | None = None) -> Modifying:
+def touchpad(u: ILoveUI, touchpad_vec: Ref[tuple[float, float]], touchpad_handle: Callable[[ILoveUI], Modifying] | None = None, check_scissor_rect: bool = True) -> Modifying:
 
     if touchpad_handle is None:
         touchpad_handle = default_touchpad_handle
@@ -1407,7 +1477,7 @@ def touchpad(u: ILoveUI, touchpad_vec: Ref[tuple[float, float]], touchpad_handle
     def touchpad_modifier(p: Placeable) -> Placeable:
         def place_fn(ctx: PlaceContext):
             def consume_new_finger_events(e: NewFingerEvent) -> bool:
-                in_rect = ctx.rect.contains_point(e.finger.x, e.finger.y)
+                in_rect = e.finger.in_rect(ctx, check_scissor_rect)
 
                 def handle_finger(finger: Finger):
                     touchpad_vec.value = ((finger.x - ctx.rect.x) / ctx.rect.w, (finger.y - ctx.rect.y) / ctx.rect.h)
@@ -1443,7 +1513,7 @@ def checkbox(u: ILoveUI, id: UIPath, checked: Ref[bool]) -> Modifying:
     def checkbox_handle_modifier(p: Placeable) -> Placeable:
         def place_fn(ctx: PlaceContext):
             new_rect = ctx.rect.sub_rect_with_align(ctx.rect.h, ctx.rect.h, 1 if checked.value else 0, 0)
-            p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick))
+            p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
 
         return Placeable(p.min_width, p.min_height, place_fn)
 
@@ -1496,6 +1566,55 @@ def render_time_text(u: ILoveUI, id: UIPath) -> Modifying:
     return text(u, f'cur: {state.time_seconds:.4f}s, max: {state.max_time_seconds:.4f}s') \
         .modifier(measure_time_modifier)
 
+def bitmap_ui(
+    u: ILoveUI, id: UIPath,
+    bitmap: bytearray,
+    set_byte_at: Callable[[int, bool], None] | None = None,
+    row_byte_count: int = 8
+) -> Modifying:
+    '''
+    用 byte 表示 bool
+    '''
+    green = Color(20, 255, 20)
+    gray = Color(20, 20, 20)
+
+    def flip_index(index: int) -> None:
+        if set_byte_at is None:
+            bitmap[index] = 0 if bitmap[index] != 0 else 1
+        else:
+            set_byte_at(index, False if bitmap[index] != 0 else True)
+
+    def byte_ui(u: ILoveUI, index: int) -> Modifying:
+        return spacing(u) \
+            .flex() \
+            .background(green if bitmap[index] != 0 else gray) \
+            .clickable(highlight, lambda _: flip_index(index))
+
+    @column_content(u)
+    def byte_rows_col(u: ILoveUI):
+        bytes_count = len(bitmap)
+
+        for row_number in range((bytes_count + row_byte_count - 1) // row_byte_count):
+            index_base = row_number * row_byte_count
+
+            @row_content(u)
+            def bytes_row(u: ILoveUI):
+                for col_number in range(row_byte_count):
+                    index = index_base + col_number
+
+                    if index >= bytes_count:
+                        spacing(u).flex() # 代替缺失的位参与布局, 保持最后一行布局正常
+                        continue
+
+                    byte_ui(u, index)
+
+            bytes_row \
+                .ratio_expend(row_byte_count, 1) \
+                .tag(u, str(index_base), id / index_base)
+
+    return byte_rows_col \
+        .v_scroll(id / 'scroll')
+
 # ==================== renderer ====================
 
 class PygameILoveUIRenderer(Renderer):
@@ -1507,30 +1626,51 @@ class PygameILoveUIRenderer(Renderer):
     ) -> None:
         super().__init__()
         self.screen_surface = screen_surface
+        self.buffer_surface = pygame.Surface(screen_surface.get_size(), pygame.SRCALPHA)
 
         if init_pygame_font:
             pygame.font.init()
 
         self.font = font if font is not None else pygame.font.SysFont(['Arial', 'SimHei'], 24)
 
-        self.scissor_stack: list[tuple[float, float, float, float]] = []
+        self.scissor_stack: list[Rect] = []
+
+    def _bilt_screen(self):
+        self.screen_surface.blit(self.buffer_surface, (0, 0))
+        self.buffer_surface.fill((0, 0, 0, 0))
+
+    def _sync_buffer_size(self):
+        bw, bh = self.buffer_surface.get_size()
+        sw, sh = self.screen_surface.get_size()
+        if bw < sw or bh < sh:
+            self.buffer_surface = pygame.Surface((max(bw, sw), max(bh, sh)), pygame.SRCALPHA)
 
     @functools.lru_cache(maxsize=128)
-    def text_to_surface(self, s: str, color) -> pygame.Surface:
+    def _text_to_surface(self, s: str, color) -> pygame.Surface:
         return self.font.render(s, True, color)
 
     def fill_rect(self, rect: Rect, color: Color, line_width: float = 0) -> None:
         color_tuple = color.to_tuple()
 
-        pygame.draw.rect(
-            self.screen_surface,
-            color_tuple,
-            rect.to_tuple(),
-            width=int(line_width)
-        )
+        if color.a != 255:
+            self._sync_buffer_size()
+            pygame.draw.rect(
+                self.buffer_surface,
+                color_tuple,
+                rect.to_tuple(),
+                width=int(line_width)
+            )
+            self._bilt_screen()
+        else:
+            pygame.draw.rect(
+                self.screen_surface,
+                color_tuple,
+                rect.to_tuple(),
+                width=int(line_width)
+            )
 
-    def draw_text(self, text_str: str, color: Color = Color(255, 255, 255)) -> Renderer.TextRenderer:
-        text_surf = self.text_to_surface(text_str, color.to_tuple())
+    def draw_text(self, text_str: str, color: Color = Color(255, 255, 255)) -> Renderer.Renderable:
+        text_surf = self._text_to_surface(text_str, color.to_tuple())
         min_width = text_surf.get_width()
         min_height = text_surf.get_height()
 
@@ -1541,7 +1681,7 @@ class PygameILoveUIRenderer(Renderer):
             blit_y = rect.y + (rect.h - surf.get_height()) / 2
             self.screen_surface.blit(surf, (blit_x, blit_y))
 
-        return Renderer.TextRenderer(min_width, min_height, render)
+        return Renderer.Renderable(min_width, min_height, render)
 
     def draw_line(self, color: Color, start_pos: tuple[float, float], end_pos: tuple[float, float], width: int = 1) -> None:
         pygame.draw.line(self.screen_surface, color.to_tuple(), start_pos, end_pos, width)
@@ -1549,10 +1689,10 @@ class PygameILoveUIRenderer(Renderer):
     def fill_circle(self, x: float, y: float, radius: float, color: Color) -> None:
         pygame.draw.circle(self.screen_surface, color.to_tuple(), (x, y), radius)
 
-    def push_scissor(self, rect: Rect) -> None:
-        rect_tuple = rect.to_tuple()
-        self.scissor_stack.append(rect_tuple)
-        self.screen_surface.set_clip(rect_tuple)
+    def push_scissor(self, rect: Rect, for_render: bool = True) -> None:
+        self.scissor_stack.append(rect)
+        if for_render:
+            self.screen_surface.set_clip(rect.to_tuple())
 
     def pop_scissor(self) -> None:
         count = len(self.scissor_stack)
@@ -1560,8 +1700,264 @@ class PygameILoveUIRenderer(Renderer):
             raise IndexError("must call 'push_scissor' before call 'pop_scissor'")
 
         del self.scissor_stack[count - 1]
-        rect = self.scissor_stack[count - 2] if count - 2 >= 0 else None
-        self.screen_surface.set_clip(rect)
+        rect_tuple = self.scissor_stack[count - 2].to_tuple() if count - 2 >= 0 else None
+        self.screen_surface.set_clip(rect_tuple)
+
+    @property
+    def scissor_rect(self) -> Rect | None:
+        return self.scissor_stack[-1] if self.scissor_stack else None
+
+    def get_scissor_count(self) -> int:
+        return len(self.scissor_stack)
+
+
+# ==================== fast debug ====================
+
+class RenderLayerMode(Enum):
+    all = auto()
+    exactly = auto()
+    before = auto()
+    after = auto()
+
+    def next_mode(self) -> 'RenderLayerMode':
+        match self:
+            case RenderLayerMode.all:
+                return RenderLayerMode.exactly
+            case RenderLayerMode.exactly:
+                return RenderLayerMode.before
+            case RenderLayerMode.before:
+                return RenderLayerMode.after
+            case RenderLayerMode.after:
+                return RenderLayerMode.all
+            case _:
+                raise ValueError(self)
+
+def render_layer_control_ui(u: ILoveUI, max_layer: int, layer: Ref[int], mode: Ref[RenderLayerMode]) -> Modifying:
+    @row_content(u)
+    def top_row(u: ILoveUI):
+        text(u, '<') \
+            .ratio_expend(1, 1) \
+            .clickable(highlight, lambda _: layer.set(layer.value - 1))
+
+        slider(u, Ref(layer.get, lambda value: layer.set(round(value))), 0, max_layer, check_scissor_rect=False) \
+            .flex() \
+            .tag(u, f'layer: {layer.value}  ', with_spacing=False, min_size=120) \
+            .tag_right(u, f'  max: {max_layer}', min_size=120)
+
+        text(u, '>') \
+            .ratio_expend(1, 1) \
+            .clickable(highlight, lambda _: layer.set(layer.value + 1))
+
+        text(u, mode.value.name) \
+            .min_size_xy(80, 0) \
+            .clickable(highlight, lambda _: mode.set(mode.value.next_mode()), check_scissor_rect=False)
+
+    return top_row
+
+@dataclass(slots=True)
+class UIRendererUIState:
+    single_step_mode: bool = False
+    step: bool = False
+    cached_render_tick_listeners: list[Callable[[], None]] | None = None
+
+    def toggle_mode(self) -> None:
+        self.single_step_mode = not self.single_step_mode
+
+    def toggle_step(self) -> None:
+        self.step = not self.step
+
+def ui_renderer_ui(
+    u: ILoveUI,
+    state: UIRendererUIState,
+    ui: Callable[[ILoveUI], None],
+    map_render_tick_listeners: Callable[[list[RenderOperate]], list[RenderOperate]] | None = None
+) -> Modifying:
+
+    def place_component(ctx: PlaceContext) -> list[RenderOperate]:
+        '''
+        收集绘制指令到 list
+        '''
+        p = u.context.to_placeable(ui)
+        render_tick_listeners: list[RenderOperate] = []
+        p.place_fn(PlaceContext(ctx.rect, ctx.context, render_tick_listeners))
+        return render_tick_listeners
+
+    def place_fn(ctx: PlaceContext):
+        if not state.single_step_mode:
+            lst = place_component(ctx)
+            state.cached_render_tick_listeners = lst
+        elif state.step:
+            state.step = False
+            lst = place_component(ctx)
+            state.cached_render_tick_listeners = lst
+        else:
+            lst: list[RenderOperateType[Callable[[], None]]] = state.cached_render_tick_listeners # type: ignore
+
+        ctx.deferred_render_tick_listeners += map_render_tick_listeners(lst) if map_render_tick_listeners is not None else lst
+
+    return u.element(place_fn)
+
+def render_mode_to_list_mapper(layer: int, mode: RenderLayerMode) -> Callable[[list[RenderOperate]], list[RenderOperate]]:
+    match mode:
+        case RenderLayerMode.all:
+            return lambda x: x
+        case RenderLayerMode.exactly:
+            def exactly_mapper(lst: list[RenderOperate]) -> list[RenderOperate]:
+                if layer not in range(len(lst)):
+                    return []
+                op = lst[layer]
+                if op.type == RenderOperateType.scissor_op:
+                    return []
+                return [op]
+            return exactly_mapper
+
+        case RenderLayerMode.before:
+            def before_mapper(lst: list[RenderOperate]) -> list[RenderOperate]:
+                return [e for i, e in enumerate(lst) if i <= layer or e.type == RenderOperateType.scissor_op]
+            return before_mapper
+
+        case RenderLayerMode.after:
+            def after_mapper(lst: list[RenderOperate]) -> list[RenderOperate]:
+                return [e for i, e in enumerate(lst) if i >= layer or e.type == RenderOperateType.scissor_op]
+            return after_mapper
+
+        case _:
+            raise ValueError('unreachable')
+
+@dataclass(slots=True)
+class FastStartContext:
+    fps: float
+
+def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
+    layer = Ref.new_box(10)
+    render_mode = Ref.new_box(RenderLayerMode.all)
+    ui_renderer_ui_state = UIRendererUIState()
+
+    def fast_debug_ui(u: ILoveUI, ctx: FastStartContext) -> None:
+        # todo 随意调节窗口大小
+        # todo 暂停, 逐帧推进 [v]
+        # todo 拦截所有事件并提供虚拟手指, 可以精确操控
+        # todo 逐层渲染 [v]
+
+        @column_content(u)
+        def top_column(u: ILoveUI):
+
+            ui_renderer_ui(u, ui_renderer_ui_state, lambda u: ui(u, ctx), map_render_tick_listeners=render_mode_to_list_mapper(layer.value, render_mode.value)).flex()
+
+            @row_content(u)
+            def control_row(u: ILoveUI):
+                text(u, f'scissors {u.context.renderer.get_scissor_count()}') \
+                    .flex() \
+                    .clickable(highlight, lambda _: toast(u, 'test'), check_scissor_rect=False)
+
+                text(u, 'single step' if ui_renderer_ui_state.single_step_mode else 'run') \
+                    .flex() \
+                    .clickable(highlight, lambda _: ui_renderer_ui_state.toggle_mode(), check_scissor_rect=False)
+
+                text(u, 'step' if ui_renderer_ui_state.step else 'none') \
+                    .flex() \
+                    .clickable(highlight, lambda _: ui_renderer_ui_state.toggle_step(), check_scissor_rect=False)
+
+                max_layer = len(ui_renderer_ui_state.cached_render_tick_listeners) if ui_renderer_ui_state.cached_render_tick_listeners is not None else 0
+
+                render_layer_control_ui(u, max_layer, layer, render_mode) \
+                    .flex(6)
+
+    fast_start(fast_debug_ui)
+
+# ==================== fast start ====================
+
+class FastStart:
+    def __init__(self, ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
+        self.ui = ui
+
+        # pygame初始化
+        pygame.init()
+        self.screen = pygame.display.set_mode((800, 800), pygame.SRCALPHA | pygame.RESIZABLE)
+        self.screen_rect = Rect(0, 0, 800, 800)
+        pygame.display.set_caption("ILoveUI")
+        self.clock = pygame.time.Clock()
+        self.running = True
+
+        self.renderer = PygameILoveUIRenderer(self.screen)
+        ctx = ILoveUIContext(self.renderer)
+        ctx.fingers.append(Finger(0, 0))
+        self.ctx = ctx
+
+    def tick(self) -> None:
+        if not self.running:
+            return
+        ctx = self.ctx
+
+        # 事件处理
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                self.running = False
+
+            elif e.type == pygame.VIDEORESIZE:
+                self.screen_rect = Rect(0, 0, e.size[0], e.size[1])
+
+            elif e.type == pygame.MOUSEWHEEL:
+                mouse_x, mouse_y = pygame.mouse.get_pos()
+                ctx.event_manager.send_event(ScrollEvent, ScrollEvent(mouse_x, mouse_y, e.x, e.y))
+
+            elif e.type == pygame.MOUSEBUTTONDOWN:
+                if e.button != 4 and e.button != 5: # 排除滚轮事件
+                    x, y = e.pos
+                    finger = Finger(x, y)
+                    if len(ctx.fingers) > 0:
+                        ctx.fingers[0] = finger
+                    else:
+                        ctx.fingers.append(finger)
+                    ctx.event_manager.send_event(NewFingerEvent, NewFingerEvent(finger))
+
+            elif e.type == pygame.MOUSEMOTION:
+                if len(ctx.fingers) > 0:
+                    finger = ctx.fingers[0]
+                    x, y = e.pos
+                    finger.x = x
+                    finger.y = y
+                    if finger.drag_listener is not None:
+                        finger.drag_listener(finger)
+
+            elif e.type == pygame.MOUSEBUTTONUP:
+                if len(ctx.fingers) > 0:
+                    finger = ctx.fingers[0]
+                    x, y = e.pos
+                    finger.x = x
+                    finger.y = y
+                    finger.drag_listener = None
+                    if finger.release_listener is not None:
+                        finger.release_listener(finger)
+                        finger.release_listener = None
+
+            # 输入框打字
+            elif e.type == pygame.KEYDOWN:
+                ctx.event_manager.send_event(KeyEvent, KeyEvent(e.key, e.scancode, e.unicode, True))
+
+            elif e.type == pygame.KEYUP:
+                ctx.event_manager.send_event(KeyEvent, KeyEvent(e.key, e.scancode, e.unicode, False))
+
+        # 清屏
+        self.renderer.screen_surface.fill((40,40,40))
+
+        ctx.event_manager.before_render()
+        ctx.render_in(self.screen_rect, lambda u: self.ui(u, FastStartContext(self.clock.get_fps())))
+
+        # 刷新屏幕
+        pygame.display.flip()
+        self.clock.tick(60)
+
+    def quit(self) -> None:
+        self.running = False
+
+def fast_start(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
+    s = FastStart(ui)
+
+    while s.running:
+        s.tick()
+
+    pygame.quit()
 
 # ==================== test ====================
 
@@ -1730,7 +2126,7 @@ def test_scroll_ui(u: ILoveUI, id: UIPath) -> Modifying:
     @column_content(u)
     def elements_ui(u: ILoveUI):
         element_id = id / 'scroll_test_elements'
-        for i in range(120):
+        for i in range(60):
             element_button(u, i, element_id / i)
 
     return elements_ui \
@@ -1748,6 +2144,10 @@ def test_screen_content(u: ILoveUI, fps: float):
     test_ui_state = u.context.remember(TestUIState, TestUIState)
 
     popup_layer(u)
+
+    test_animation_button(u, test_ui_state.ui_root / 'test_animation_button') \
+        .expend_xy(40, 40) \
+        .align_xy(None, 0.5)
 
     @row_content(u)
     def top_row(u: ILoveUI):
@@ -1776,8 +2176,6 @@ def test_screen_content(u: ILoveUI, fps: float):
                 checked = (test_ui_state.ui_root / 'checked').remember(lambda: Ref.new_box(False))
                 checkbox(u, test_ui_state.ui_root / 'check_box', checked) \
                     .expend_xy(80, 0)
-
-                test_animation_button(u, test_ui_state.ui_root / 'test_animation_button')
 
             buttons_row.expend_xy(0, 20)
 
@@ -1842,85 +2240,16 @@ def test_screen_content(u: ILoveUI, fps: float):
 
             stateful_test_row.expend_xy(0, 20)
 
+            bitmap = (test_ui_state.ui_root / 'bitmap').remember(lambda: bytearray(100))
+            bitmap_ui(u, test_ui_state.ui_root / 'bitmap_ui', bitmap)
+
         top_column.flex()
 
     top_row \
         .animated_rect(test_ui_state.ui_root / 'top_column animate')
 
-
 def main():
-    # pygame初始化
-    pygame.init()
-    screen = pygame.display.set_mode((800, 800), pygame.SRCALPHA | pygame.RESIZABLE)
-    screen_rect = Rect(0, 0, 800, 800)
-    pygame.display.set_caption("ILoveUI")
-    clock = pygame.time.Clock()
-    running = True
-
-    ctx = ILoveUIContext(PygameILoveUIRenderer(screen))
-    ctx.fingers.append(Finger(0, 0))
-
-    while running:
-        # 事件处理
-        for e in pygame.event.get():
-            if e.type == pygame.QUIT:
-                running = False
-
-            elif e.type == pygame.VIDEORESIZE:
-                screen_rect = Rect(0, 0, e.size[0], e.size[1])
-
-            elif e.type == pygame.MOUSEWHEEL:
-                mouse_x, mouse_y = pygame.mouse.get_pos()
-                ctx.event_manager.send_event(ScrollEvent, ScrollEvent(mouse_x, mouse_y, e.x, e.y))
-
-            elif e.type == pygame.MOUSEBUTTONDOWN:
-                if e.button != 4 and e.button != 5: # 排除滚轮事件
-                    x, y = e.pos
-                    finger = Finger(x, y)
-                    if len(ctx.fingers) > 0:
-                        ctx.fingers[0] = finger
-                    else:
-                        ctx.fingers.append(finger)
-                    ctx.event_manager.send_event(NewFingerEvent, NewFingerEvent(finger))
-
-            elif e.type == pygame.MOUSEMOTION:
-                if len(ctx.fingers) > 0:
-                    finger = ctx.fingers[0]
-                    x, y = e.pos
-                    finger.x = x
-                    finger.y = y
-                    if finger.drag_listener is not None:
-                        finger.drag_listener(finger)
-
-            elif e.type == pygame.MOUSEBUTTONUP:
-                if len(ctx.fingers) > 0:
-                    finger = ctx.fingers[0]
-                    x, y = e.pos
-                    finger.x = x
-                    finger.y = y
-                    finger.drag_listener = None
-                    if finger.release_listener is not None:
-                        finger.release_listener(finger)
-                        finger.release_listener = None
-
-            # 输入框打字
-            elif e.type == pygame.KEYDOWN:
-                ctx.event_manager.send_event(KeyEvent, KeyEvent(e.key, e.scancode, e.unicode, True))
-
-            elif e.type == pygame.KEYUP:
-                ctx.event_manager.send_event(KeyEvent, KeyEvent(e.key, e.scancode, e.unicode, False))
-
-        # 清屏
-        screen.fill((40,40,40))
-
-        ctx.event_manager.before_render()
-        ctx.render_in(screen_rect, lambda u: test_screen_content(u, clock.get_fps()))
-
-        # 刷新屏幕
-        pygame.display.flip()
-        clock.tick(60)
-
-    pygame.quit()
+    fast_debug(lambda u, ctx: test_screen_content(u, ctx.fps))
 
 if __name__ == '__main__':
     main()
