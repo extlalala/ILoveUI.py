@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from asyncio import CancelledError
 from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine, Generic, Self, TypeVar
+from typing import Any, Callable, Coroutine, Generic, Hashable, Self, TypeVar
 
 T = TypeVar('T')
 
@@ -38,7 +38,7 @@ class UIPath:
         valid_key: Any
         state_value: Any
 
-    path_tuple: tuple[Any, ...]
+    path_tuple: tuple[Hashable, ...]
     state_by_path: dict['UIPath', StateEntry]
 
     @staticmethod
@@ -53,9 +53,10 @@ class UIPath:
             return True
         if not isinstance(__value, UIPath):
             return False
-        return self.path_tuple == __value.path_tuple
+        return (self.state_by_path is __value.state_by_path and
+                self.path_tuple == __value.path_tuple)
 
-    def __truediv__(self, key: Any) -> 'UIPath':
+    def __truediv__(self, key: Hashable) -> 'UIPath':
         '''
         拼接路径
         ```
@@ -102,7 +103,7 @@ def tick_coroutine_content(id: UIPath, valid_key: Any = None) -> Callable[[Calla
     用于协程动画
     '''
     def decorator(async_fn: Callable[[], Coroutine[Any, Any, None]]) -> None:
-        return tick_coroutine(id, async_fn, valid_key)
+        tick_coroutine(id, async_fn, valid_key)
     return decorator
 
 
@@ -144,6 +145,13 @@ class KeyEvent:
     unicode: str
     isDown: bool
 
+@dataclass(slots=True)
+class ScrollEvent:
+    mouse_x: float
+    mouse_y: float
+    scroll_x: float
+    scroll_y: float
+
 # ==================== core ====================
 
 @dataclass(slots=True)
@@ -161,10 +169,10 @@ class Ref(Generic[T]):
 
     @staticmethod
     def from_list_slot(lst: list[T], slot_index: int = 0) -> 'Ref[T]':
-        def set(value: T):
+        def set_value(value: T):
             lst[slot_index] = value
 
-        return Ref(lambda: lst[slot_index], set)
+        return Ref(lambda: lst[slot_index], set_value)
 
     @staticmethod
     def from_attr(obj: Any, attr_name: str) -> 'Ref[T]':
@@ -224,6 +232,12 @@ class Rect:
 
 class Renderer(ABC):
     @abstractmethod
+    def push_scissor(self, rect: Rect) -> None: ...
+
+    @abstractmethod
+    def pop_scissor(self) -> None: ...
+
+    @abstractmethod
     def fill_rect(self, rect: Rect, color: Color, line_width: float = 0) -> None: ...
 
     @dataclass
@@ -257,7 +271,7 @@ class Renderer(ABC):
 class PlaceContext:
     rect: Rect
     context: 'ILoveUIContext'
-    deferred_render_tick: Callable[[Callable[[], None]], None]
+    deferred_render_tick: Callable[[Callable[[], None]], None] # = render_tick_listeners.append, render_tick_listeners is list
 
 @dataclass(slots=True)
 class Placeable:
@@ -319,6 +333,13 @@ class Modifying:
         self.placeable = Placeable(component_min_width, component_min_height, place_fn)
         return self
 
+    def map_rect(self, mapper: Callable[[Rect], Rect], component_min_width: float = 10, component_min_height: float = 10) -> Self:
+        p = self.placeable
+        def place_fn(ctx: PlaceContext):
+            p.place_fn(PlaceContext(mapper(ctx.rect), ctx.context, ctx.deferred_render_tick))
+        self.placeable = Placeable(component_min_width, component_min_height, place_fn)
+        return self
+
     def debug_print_rect(self, name: str = 'debug') -> Self:
         p = self.placeable
         min_size = self.placeable.min_width, self.placeable.min_height
@@ -361,14 +382,14 @@ class Modifying:
             ctx.context.event_manager.consume_events(NewFingerEvent, consume_new_finger_event)
 
             if hover_color is not None and any(ctx.rect.contains_point(finger.x, finger.y) for finger in ctx.context.fingers):
-                ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, hover_color))
+                ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, hover_color)) # type: ignore
 
             p.place_fn(ctx)
 
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
-    def clickable_background(self, background_color: Color, click_callback: Callable[[Finger], None]) -> Self:
+    def clickable_background(self, background_color: Color | None, click_callback: Callable[[Finger], None]) -> Self:
         '''
         用于拦截落在背景而不是 ui 内容的点击,
         可以用来实现点击背景取消弹窗的效果
@@ -390,7 +411,8 @@ class Modifying:
 
             ctx.context.event_manager.consume_events(NewFingerEvent, consume_new_finger_event)
 
-            ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, background_color))
+            if background_color is not None:
+                ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, background_color)) # type: ignore
 
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
@@ -411,11 +433,11 @@ class Modifying:
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
-    def tag(self, u: 'ILoveUI', tag_str: str) -> Self:
+    def tag(self, u: 'ILoveUI', tag_str: str, id: UIPath | None = None) -> Self:
         p = self.placeable
 
         def row_content(u: ILoveUI):
-            tag_ui = text(u, tag_str)
+            tag_ui = text(u, tag_str, id / 'tag_ui' if id is not None else None)
             u.element_placeable(p).flex()
             spacing_copy_size(u, tag_ui) # 为了居中
 
@@ -523,6 +545,138 @@ class Modifying:
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
+    def v_scroll(
+        self,
+        id: UIPath,
+        friction: float = 0.92,
+        mouse_wheel_speed: float = -10,
+        scissor: bool = True,
+    ) -> Self:
+        p = self.placeable
+        self.placeable = scroll_modifier(id, p, horizontal=False, friction=friction, mouse_wheel_speed=mouse_wheel_speed, scissor=scissor)
+        return self
+
+    def h_scroll(
+        self,
+        id: UIPath,
+        friction: float = 0.92,
+        mouse_wheel_speed: float = -10,
+        scissor: bool = True,
+    ) -> Self:
+        p = self.placeable
+        self.placeable = scroll_modifier(id, p, horizontal=True, friction=friction, mouse_wheel_speed=mouse_wheel_speed, scissor=scissor)
+        return self
+
+@dataclass(slots=True)
+class ScrollState:
+    scroll: float = 0
+    drag_start: float = 0
+    drag_start_scroll: float = 0
+    last_drag: float = 0
+    velocity: float = 0
+    last_time: float = 0
+    dragging: bool = False
+
+def scroll_modifier(
+    id: UIPath,
+    element_ui: Placeable,
+    horizontal: bool = False,
+    friction: float = 0.92,
+    mouse_wheel_speed: float = -10,
+    scissor: bool = True,
+) -> Placeable:
+    state = id.remember(ScrollState)
+
+    def place_fn(ctx: PlaceContext):
+        total_content_size = element_ui.min_width if horizontal else element_ui.min_height
+        view_size = ctx.rect.w if horizontal else ctx.rect.h
+        max_scroll = max(0, total_content_size - view_size)
+        now = time.time()
+        dt = now - state.last_time if state.last_time > 0 else 0.016
+        state.last_time = now
+
+        #惯性
+        if abs(state.velocity) > 0.1:
+            state.scroll += state.velocity * dt
+            state.velocity *= friction
+
+        #边界回弹
+        if not state.dragging:
+            if state.scroll < 0:
+                state.scroll *= 0.8
+                state.velocity = 0
+            elif state.scroll > max_scroll:
+                state.scroll = max_scroll + (state.scroll - max_scroll) * 0.8
+                state.velocity = 0
+
+        def consume_scroll_event(e: ScrollEvent) -> bool:
+            in_rect = ctx.rect.contains_point(e.mouse_x, e.mouse_y)
+            if not in_rect:
+                return False
+
+            d = e.scroll_x if horizontal else e.scroll_y
+            d *= mouse_wheel_speed
+            state.scroll += d
+            state.velocity = d / dt
+
+            return True
+
+        ctx.context.event_manager.consume_events(ScrollEvent, consume_scroll_event)
+
+        if scissor:
+            ctx.deferred_render_tick(lambda: ctx.context.renderer.pop_scissor()) # defer 从下到上执行
+
+        if horizontal:
+            content_rect = Rect(
+                ctx.rect.x - state.scroll,
+                ctx.rect.y,
+                total_content_size,
+                ctx.rect.h,
+            )
+        else:
+            content_rect = Rect(
+                ctx.rect.x,
+                ctx.rect.y - state.scroll,
+                ctx.rect.w,
+                total_content_size,
+            )
+        child_ctx = PlaceContext(content_rect, ctx.context, ctx.deferred_render_tick)
+        element_ui.place_fn(child_ctx)
+
+        if scissor:
+            ctx.deferred_render_tick(lambda: ctx.context.renderer.push_scissor(ctx.rect)) # defer 从下到上执行
+
+        #拖拽
+        def consume_finger(e: NewFingerEvent) -> bool:
+            in_rect = ctx.rect.contains_point(e.finger.x, e.finger.y)
+            if not in_rect:
+                return False
+
+            def on_drag(f: Finger):
+                f_pos = f.x if horizontal else f.y
+                d = f_pos - state.last_drag
+                state.scroll = state.drag_start_scroll - (f_pos - state.drag_start)
+                state.velocity = -d / dt
+                state.last_drag = f_pos
+
+            def on_release(_):
+                state.dragging = False
+
+            state.dragging = True
+            state.drag_start = e.finger.x if horizontal else e.finger.y
+            state.last_drag = state.drag_start
+            state.drag_start_scroll = state.scroll
+            e.finger.drag_listener = on_drag
+            e.finger.release_listener = on_release
+
+            return True
+
+        ctx.context.event_manager.consume_events(NewFingerEvent, consume_finger)
+
+        ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, Color(30, 30, 30)))
+
+    return Placeable(40, element_ui.min_height, place_fn) if horizontal else Placeable(element_ui.min_width, 40, place_fn)
+
 class EventManager:
     def __init__(self) -> None:
         self.event_by_type: dict[Any, list[Any]] = {}
@@ -532,7 +686,6 @@ class EventManager:
         self.event_by_type.clear()
 
         for type, e in self.new_events:
-
             if type not in self.event_by_type:
                 self.event_by_type[type] = []
 
@@ -540,7 +693,7 @@ class EventManager:
 
         self.new_events.clear()
 
-    def send(self, type: type[T], e: T) -> None:
+    def send_event(self, type: type[T], e: T) -> None:
         self.new_events.append((type, e))
 
     def consume_events(self, type: type[T], consume: Callable[[T], bool]) -> None:
@@ -560,8 +713,10 @@ class TypeValueMap:
         self.instance_by_type[cls_as_key] = value
 
     def remember(self, cls_as_key: type[T], calc: Callable[[], T]) -> T:
-        if cls_as_key in self.instance_by_type:
-            return self.instance_by_type[cls_as_key]
+        instance = self.instance_by_type.get(cls_as_key)
+        if instance is not None:
+            return instance
+
         instance = calc()
         self.instance_by_type[cls_as_key] = instance
         return instance
@@ -582,8 +737,6 @@ class ILoveUIContext:
     def remember(self, cls_as_key: type[T], calc: Callable[[], T]) -> T:
         return self.type_value_map.remember(cls_as_key, calc)
 
-    # ==================== fast start ====================
-
     def place_in(self, rect: Rect, place_fn: Callable[[PlaceContext], None]) -> None:
         render_tick_listeners: list[Callable[[], None]] = []
 
@@ -598,13 +751,19 @@ class ILoveUIContext:
         content: Callable[['ILoveUI'], None],
         layout: Callable[['ILoveUI', Callable[['ILoveUI'], None]], Modifying] | None = None
     ) -> Placeable:
-        u = ILoveUI(self)
         if layout is None:
             layout = box
+
+        u = ILoveUI(self)
         return layout(u, content).placeable
 
-    def render_in(self, rect: Rect, content: Callable[['ILoveUI'], None]) -> None:
-        placeable = self.to_placeable(content)
+    def render_in(
+        self,
+        rect: Rect,
+        content: Callable[['ILoveUI'], None],
+        layout: Callable[['ILoveUI', Callable[['ILoveUI'], None]], Modifying] | None = None
+    ) -> None:
+        placeable = self.to_placeable(content, layout=layout)
         self.place_in(rect, placeable.place_fn)
 
 class ILoveUI:
@@ -723,11 +882,11 @@ def toast(u: ILoveUI, toast_str: str) -> None:
         if current_time - create_time > TOAST_DURATION_SECONDS:
             ctx.close()
 
-        t = text(u, toast_str)
+        t = text(u, toast_str, state / 'toast_str')
         min_w, min_h = t.placeable.min_width, t.placeable.min_height
         t.expend_xy(20, 20) \
             .background(Color(0, 0, 0, 127), touch_through=True) \
-            .animated_rect(state, lambda r: r.sub_rect_with_align(min_w, min_h, 0.5, 0.5)) \
+            .animated_rect(state / 'animated_rect', lambda r: r.sub_rect_with_align(min_w, min_h, 0.5, 0.5)) \
             .offset_xy(0, offset) \
             .align_xy(0.5, 0.85)
 
@@ -753,7 +912,7 @@ def dialog(
 
         @column_content(u)
         def top_column(u: ILoveUI):
-            text(u, text_str) \
+            text(u, text_str, popup_state / 'text_str') \
                 .expend_xy(20, 20) \
                 .flex()
 
@@ -771,7 +930,7 @@ def dialog(
 
         top_column \
             .background(Color(80, 80, 80)) \
-            .animated_rect(popup_state) \
+            .animated_rect(popup_state / 'animated_rect') \
             .align_xy(0.5, 0.5) \
             .clickable_background(Color(0, 0, 0, 80), cancel_dialog)
 
@@ -833,11 +992,9 @@ def window(
     @popup_content(u)
     def window_popup(u: ILoveUI, ctx: PopupContext) -> None:
 
-        @(lambda f: layout(u, f))
-        def content_box(u: ILoveUI) -> None:
-            content(u, ctx)
+        content_ui = layout(u, lambda u: content(u, ctx))
 
-        content_box \
+        content_ui \
             .background(Color(40, 40, 40), touch_through=True) \
             .padding_xy(WINDOW_FRAME_SIZE, WINDOW_FRAME_SIZE) \
             .modifier(draggable_modifier) \
@@ -848,9 +1005,14 @@ def window(
 
 # ==================== layouts ====================
 
-def memo_content(u: ILoveUI, id: UIPath, valid_key: Any) -> Callable[[Callable[[ILoveUI], None]], Modifying]:
+def memo_content(
+    u: ILoveUI,
+    id: UIPath,
+    valid_key: Any = None,
+    layout: Callable[[ILoveUI, Callable[[ILoveUI], None]], Modifying] | None = None
+) -> Callable[[Callable[[ILoveUI], None]], Modifying]:
     def decorator(content: Callable[[ILoveUI], None]) -> Modifying:
-        return memo(u, id, content, valid_key)
+        return memo(u, id, content, valid_key, layout)
     return decorator
 
 @dataclass(slots=True)
@@ -886,7 +1048,7 @@ def memo(
         def place_component() -> list[Callable[[], None]]:
             render_tick_listeners: list[Callable[[], None]] = []
 
-            # 确保每次 place_component 都重新布局
+            # 确保每次 place_component 都对应一次 layout_component
             if not state.new_memo:
                 state.memo_placeable = layout_component()
 
@@ -1063,7 +1225,7 @@ def text(u: ILoveUI, s: str, id: UIPath | None = None) -> Modifying:
     if id is None:
         text_renderer = u.context.renderer.draw_text(s)
     else:
-        text_renderer = (id / 'text_renderer').remember(lambda: u.context.renderer.draw_text(s), valid_key=s)
+        text_renderer = id.remember(lambda: u.context.renderer.draw_text(s), valid_key=s)
 
     def place_fn(ctx: PlaceContext):
         ctx.deferred_render_tick(lambda: text_renderer.render(ctx.rect))
@@ -1076,7 +1238,7 @@ def text(u: ILoveUI, s: str, id: UIPath | None = None) -> Modifying:
 
 @dataclass(slots=True)
 class FocusManager:
-    focused_ui_path: UIPath | None = field(default=None)
+    focused_ui_path: UIPath | None = None
 
 @dataclass(slots=True)
 class TextFieldState:
@@ -1089,22 +1251,22 @@ class TextFieldState:
         self.blink_state = True
 
 def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "type something...") -> Modifying:
-    def add_unfocus_click_layer():
+    focus_manager = u.context.remember(FocusManager, FocusManager)
+
+    def add_invisible_unfocus_click_layer():
         @popup_content(u)
-        def popup_layer(u: ILoveUI, popup_ctx: PopupContext):
+        def popup_layer(u: ILoveUI, ctx: PopupContext):
             def unfocus(_):
-                popup_ctx.close()
+                ctx.close()
                 if focus_manager.focused_ui_path == id:
                     focus_manager.focused_ui_path = None
 
             if focus_manager.focused_ui_path != id:
-                popup_ctx.close()
+                ctx.close()
 
             spacing(u).on_touchdown(unfocus)
 
-    focus_manager = u.context.remember(FocusManager, FocusManager)
     state = id.remember(TextFieldState)
-
     min_w = 80
     min_h = 36
 
@@ -1115,7 +1277,7 @@ def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "t
             in_rect = ctx.rect.contains_point(e.finger.x, e.finger.y)
             if in_rect and focus_manager.focused_ui_path != id:
                 focus_manager.focused_ui_path = id
-                add_unfocus_click_layer()
+                add_invisible_unfocus_click_layer()
 
             return in_rect
 
@@ -1168,11 +1330,7 @@ def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "t
     return u.element(place_fn, min_w, min_h)
 
 def slider(u: ILoveUI, value_ref: Ref[float], min_val: float, max_val: float) -> Modifying:
-    min_w = 30
-    min_h = 30
-
     def place_fn(ctx: PlaceContext):
-
         def consume_new_finger_event(e: NewFingerEvent) -> bool:
             in_rect = ctx.rect.contains_point(e.finger.x, e.finger.y)
 
@@ -1203,7 +1361,7 @@ def slider(u: ILoveUI, value_ref: Ref[float], min_val: float, max_val: float) ->
 
         ctx.deferred_render_tick(render)
 
-    return u.element(place_fn, min_w, min_h)
+    return u.element(place_fn, 30, 30)
 
 def number_pad(u: ILoveUI, number_typed: Callable[[int], None], id: UIPath | None = None) -> Modifying:
     def number_button(u: ILoveUI, number: int) -> Modifying:
@@ -1314,8 +1472,8 @@ def checkbox(u: ILoveUI, id: UIPath, checked: Ref[bool]) -> Modifying:
 
 @dataclass(slots=True)
 class RenderTimeText:
-    time_seconds: float = field(default=0)
-    max_time_seconds: float = field(default=0)
+    time_seconds: float = 0
+    max_time_seconds: float = 0
 
     def set_time_seconds(self, value: float) -> None:
         self.time_seconds = value
@@ -1355,6 +1513,8 @@ class PygameILoveUIRenderer(Renderer):
 
         self.font = font if font is not None else pygame.font.SysFont(['Arial', 'SimHei'], 24)
 
+        self.scissor_stack: list[tuple[float, float, float, float]] = []
+
     @functools.lru_cache(maxsize=128)
     def text_to_surface(self, s: str, color) -> pygame.Surface:
         return self.font.render(s, True, color)
@@ -1389,6 +1549,20 @@ class PygameILoveUIRenderer(Renderer):
     def fill_circle(self, x: float, y: float, radius: float, color: Color) -> None:
         pygame.draw.circle(self.screen_surface, color.to_tuple(), (x, y), radius)
 
+    def push_scissor(self, rect: Rect) -> None:
+        rect_tuple = rect.to_tuple()
+        self.scissor_stack.append(rect_tuple)
+        self.screen_surface.set_clip(rect_tuple)
+
+    def pop_scissor(self) -> None:
+        count = len(self.scissor_stack)
+        if count <= 0:
+            raise IndexError("must call 'push_scissor' before call 'pop_scissor'")
+
+        del self.scissor_stack[count - 1]
+        rect = self.scissor_stack[count - 2] if count - 2 >= 0 else None
+        self.screen_surface.set_clip(rect)
+
 # ==================== test ====================
 
 @dataclass(slots=True)
@@ -1402,7 +1576,7 @@ def test_animation_button(u: ILoveUI, id: UIPath) -> Modifying:
 
     def startAnimation(_):
         state.animation_has_started = True
-        state.animation_valid_key = state.animation_valid_key + 1 if state.animation_valid_key is not None else 0
+        state.animation_valid_key = state.animation_valid_key + 1
 
     if state.animation_has_started:
         @tick_coroutine_content(id / 'animate test coroutine', state.animation_valid_key)
@@ -1414,7 +1588,7 @@ def test_animation_button(u: ILoveUI, id: UIPath) -> Modifying:
                 state.align = 1 - i / 59
                 await suspend
 
-    return text(u, 'animate test') \
+    return text(u, 'animate test', id / 'animate test text') \
         .flex() \
         .background(Color(100, 100, 100, 255)) \
         .clickable(highlight, startAnimation) \
@@ -1441,7 +1615,7 @@ def hello_world_button(u: ILoveUI) -> Modifying:
         .clickable(highlight, lambda _: toast(u, 'hello'))
 
 def open_window_button(u: ILoveUI, id: UIPath) -> Modifying:
-    rect = (id / 'rect').remember(lambda: Ref.new_box(Rect(0, 0, 100, 100)))
+    rect_ref = (id / 'rect_ref').remember(lambda: Ref.new_box(Rect(0, 0, 100, 100)))
 
     def open_window(_):
         @dataclass(slots=True)
@@ -1453,8 +1627,8 @@ def open_window_button(u: ILoveUI, id: UIPath) -> Modifying:
         window_id = UIPath.root()
 
         random_offset = 40
-
-        @window_content(u, initial_x=rect.value.center_x + random.random() * random_offset, initial_y=rect.value.y + rect.value.h + 40 + random.random() * random_offset)
+        r = rect_ref.value
+        @window_content(u, initial_x=r.center_x + random.random() * random_offset, initial_y=r.y + r.h + 40 + random.random() * random_offset)
         def window_test(u: ILoveUI, ctx: PopupContext):
             def close_window(_):
                 toast(u, 'window closing')
@@ -1516,12 +1690,11 @@ def open_window_button(u: ILoveUI, id: UIPath) -> Modifying:
             .clickable(highlight, open_more_window)
 
     return buttons_row \
-        .getRect(rect)
+        .getRect(rect_ref)
 
 def fruits_ui(u: ILoveUI, id: UIPath, fruits_lst: list[str], selected_index: Ref[int]) -> Modifying:
     @memo_content(u, id / 'memo test', fruits_lst[selected_index.value])
     def memo_test(u: ILoveUI):
-        print('memo fruit')
         text(u, fruits_lst[selected_index.value]) \
             .repaint_flash()
 
@@ -1547,6 +1720,23 @@ def fruits_ui(u: ILoveUI, id: UIPath, fruits_lst: list[str], selected_index: Ref
     return fruits_row \
         .expend_xy(0, 20)
 
+def test_scroll_ui(u: ILoveUI, id: UIPath) -> Modifying:
+    def element_button(u: ILoveUI, i: int, id: UIPath) -> Modifying:
+        return text(u, f'element {i}', id) \
+            .background(Color(80, 80, 80)) \
+            .clickable(highlight, lambda _: toast(u, f'element {i}')) \
+            .align_xy(0, 0.5)
+
+    @column_content(u)
+    def elements_ui(u: ILoveUI):
+        element_id = id / 'scroll_test_elements'
+        for i in range(120):
+            element_button(u, i, element_id / i)
+
+    return elements_ui \
+        .v_scroll(id / 'scroll_test') \
+        .expend_xy(40, 80)
+
 @dataclass(slots=True)
 class TestUIState:
     fruits: list[str] = field(default_factory=lambda: ['apple', 'banana', 'watermelon', 'pear', 'cherry'])
@@ -1559,96 +1749,102 @@ def test_screen_content(u: ILoveUI, fps: float):
 
     popup_layer(u)
 
-    @column_content(u)
-    def top_column(u: ILoveUI):
-        render_time_text(u, test_ui_state.ui_root / 'render_time_text') \
-            .tag(u, 'Render Time: ') \
+    @row_content(u)
+    def top_row(u: ILoveUI):
 
-        text(u, f'{fps:.4f}') \
-            .tag(u, 'fps: ')
+        test_scroll_ui(u, test_ui_state.ui_root / 'test_scroll_ui')
 
-        popup_manager = u.context.remember(PopupManager, PopupManager)
+        @column_content(u)
+        def top_column(u: ILoveUI):
+            render_time_text(u, test_ui_state.ui_root / 'render_time_text') \
+                .tag(u, 'Render Time: ') \
 
-        text(u, f'{len(popup_manager.popups)}') \
-            .tag(u, 'popup count: ')
+            text(u, f'{fps:.4f}') \
+                .tag(u, 'fps: ')
 
-        @row_content(u)
-        def buttons_row(u: ILoveUI):
-            sleep_button(u, test_ui_state.ui_root / 'sleep button')
-            hello_world_button(u)
-            open_window_button(u, test_ui_state.ui_root / 'open_window_button')
+            popup_manager = u.context.remember(PopupManager, PopupManager)
 
-            checked = (test_ui_state.ui_root / 'checked').remember(lambda: Ref.new_box(False))
-            checkbox(u, test_ui_state.ui_root / 'check_box', checked) \
-                .expend_xy(80, 0)
+            text(u, f'{len(popup_manager.popups)}') \
+                .tag(u, 'popup count: ')
 
-            test_animation_button(u, test_ui_state.ui_root / 'test_animation_button')
+            @row_content(u)
+            def buttons_row(u: ILoveUI):
+                sleep_button(u, test_ui_state.ui_root / 'sleep button')
+                hello_world_button(u)
+                open_window_button(u, test_ui_state.ui_root / 'open_window_button')
 
-        buttons_row.expend_xy(0, 20)
+                checked = (test_ui_state.ui_root / 'checked').remember(lambda: Ref.new_box(False))
+                checkbox(u, test_ui_state.ui_root / 'check_box', checked) \
+                    .expend_xy(80, 0)
 
-        fruits_ui(u, test_ui_state.ui_root / 'fruits ui', test_ui_state.fruits, Ref.from_attr(test_ui_state, 'selected'))
+                test_animation_button(u, test_ui_state.ui_root / 'test_animation_button')
 
-        spacing(u, 0, 10)
+            buttons_row.expend_xy(0, 20)
 
-        # 文本输入框
-        input_text_1 = (test_ui_state.ui_root / 'input_text_1').remember(lambda: Ref.new_box(''))
-        input_text_2 = (test_ui_state.ui_root / 'input_text_2').remember(lambda: Ref.new_box(''))
+            fruits_ui(u, test_ui_state.ui_root / 'fruits ui', test_ui_state.fruits, Ref.from_attr(test_ui_state, 'selected'))
 
-        @memo_content(u, test_ui_state.ui_root / 'memo_text_field_test', input_text_1.value)
-        def memo_text_field_test(u: ILoveUI):
-            print('memo_text_field_test')
-            text(u, f"memo text field: {input_text_1.value}") \
-                .repaint_flash()
+            spacing(u, 0, 10)
 
-        text_field(u, test_ui_state.ui_root / 'text_field 1', input_text_1) \
-            .padding_xy(20, 0)
+            # 文本输入框
+            input_text_1 = (test_ui_state.ui_root / 'input_text_1').remember(lambda: Ref.new_box(''))
+            input_text_2 = (test_ui_state.ui_root / 'input_text_2').remember(lambda: Ref.new_box(''))
 
-        text_field(u, test_ui_state.ui_root / 'text_field 2', input_text_2) \
-            .padding_xy(20, 0)
+            @memo_content(u, test_ui_state.ui_root / 'memo_text_field_test', input_text_1.value)
+            def memo_text_field_test(u: ILoveUI):
+                text(u, f"memo text field: {input_text_1.value}") \
+                    .repaint_flash()
 
-        spacing(u, 0, 10)
+            text_field(u, test_ui_state.ui_root / 'text_field 1', input_text_1) \
+                .padding_xy(20, 0)
 
-        # 数字滑块
-        text(u, f"value: {test_ui_state.slider_val[0]:.0f}")
-        slider(u, Ref.from_list_slot(test_ui_state.slider_val), 0, 100)
+            text_field(u, test_ui_state.ui_root / 'text_field 2', input_text_2) \
+                .padding_xy(20, 0)
 
-        def dialog_cancelled() -> bool:
-            toast(u, 'cancelled')
-            return True
+            spacing(u, 0, 10)
 
-        def open_dialog(_):
-            dialog(u, 'test dialog', lambda yes_or_no: toast(u, f'you chosen {yes_or_no}'), dialog_cancelled)
+            # 数字滑块
+            text(u, f"value: {test_ui_state.slider_val[0]:.0f}")
+            slider(u, Ref.from_list_slot(test_ui_state.slider_val), 0, 100)
 
-        text(u, 'dialog') \
-            .expend_xy(20, 20) \
-            .clickable(highlight, open_dialog)
+            def dialog_cancelled() -> bool:
+                toast(u, 'cancelled')
+                return True
 
-        touchpad_vec = (test_ui_state.ui_root / 'touchpad_vec').remember(lambda: Ref[tuple[float, float]].new_box((0.5, 0.5)))
+            def open_dialog(_):
+                dialog(u, 'test dialog', lambda yes_or_no: toast(u, f'you chosen {yes_or_no}'), dialog_cancelled)
 
-        touchpad(u, touchpad_vec) \
-            .expend_xy(20, 20) \
-            .background(Color(100, 100, 100)) \
-            .align_xy(0, 0)
+            text(u, 'dialog') \
+                .expend_xy(20, 20) \
+                .clickable(highlight, open_dialog)
 
-        def click_inc_number_button(u: ILoveUI, id: UIPath) -> Modifying:
-            count_ref = (id / 'count_ref').remember(lambda: [0])
+            touchpad_vec = (test_ui_state.ui_root / 'touchpad_vec').remember(lambda: Ref[tuple[float, float]].new_box((0.5, 0.5)))
 
-            def inc_count(_):
-                count_ref[0] += 1
-                toast(u, f'current count: {count_ref[0]}')
+            touchpad(u, touchpad_vec) \
+                .expend_xy(20, 20) \
+                .background(Color(100, 100, 100)) \
+                .align_xy(0, 0)
 
-            return text(u, f'click me: {count_ref[0]}') \
-                .clickable(highlight, inc_count)
+            def click_inc_number_button(u: ILoveUI, id: UIPath) -> Modifying:
+                count_ref = (id / 'count_ref').remember(lambda: [0])
 
-        @row_content(u)
-        def stateful_test_row(u: ILoveUI):
-            id = test_ui_state.ui_root
-            click_inc_number_button(u, id / 'click_inc_number_button 1').flex()
-            click_inc_number_button(u, id / 'click_inc_number_button 2').flex()
+                def inc_count(_):
+                    count_ref[0] += 1
+                    toast(u, f'current count: {count_ref[0]}')
 
-        stateful_test_row.expend_xy(0, 20)
+                return text(u, f'click me: {count_ref[0]}') \
+                    .clickable(highlight, inc_count)
 
-    top_column \
+            @row_content(u)
+            def stateful_test_row(u: ILoveUI):
+                id = test_ui_state.ui_root
+                click_inc_number_button(u, id / 'click_inc_number_button 1').flex()
+                click_inc_number_button(u, id / 'click_inc_number_button 2').flex()
+
+            stateful_test_row.expend_xy(0, 20)
+
+        top_column.flex()
+
+    top_row \
         .animated_rect(test_ui_state.ui_root / 'top_column animate')
 
 
@@ -1673,14 +1869,19 @@ def main():
             elif e.type == pygame.VIDEORESIZE:
                 screen_rect = Rect(0, 0, e.size[0], e.size[1])
 
+            elif e.type == pygame.MOUSEWHEEL:
+                mouse_x, mouse_y = pygame.mouse.get_pos()
+                ctx.event_manager.send_event(ScrollEvent, ScrollEvent(mouse_x, mouse_y, e.x, e.y))
+
             elif e.type == pygame.MOUSEBUTTONDOWN:
-                x, y = e.pos
-                finger = Finger(x, y)
-                if len(ctx.fingers) > 0:
-                    ctx.fingers[0] = finger
-                else:
-                    ctx.fingers.append(finger)
-                ctx.event_manager.send(NewFingerEvent, NewFingerEvent(finger))
+                if e.button != 4 and e.button != 5: # 排除滚轮事件
+                    x, y = e.pos
+                    finger = Finger(x, y)
+                    if len(ctx.fingers) > 0:
+                        ctx.fingers[0] = finger
+                    else:
+                        ctx.fingers.append(finger)
+                    ctx.event_manager.send_event(NewFingerEvent, NewFingerEvent(finger))
 
             elif e.type == pygame.MOUSEMOTION:
                 if len(ctx.fingers) > 0:
@@ -1704,18 +1905,16 @@ def main():
 
             # 输入框打字
             elif e.type == pygame.KEYDOWN:
-                ctx.event_manager.send(KeyEvent, KeyEvent(e.key, e.scancode, e.unicode, True))
+                ctx.event_manager.send_event(KeyEvent, KeyEvent(e.key, e.scancode, e.unicode, True))
 
             elif e.type == pygame.KEYUP:
-                ctx.event_manager.send(KeyEvent, KeyEvent(e.key, e.scancode, e.unicode, False))
+                ctx.event_manager.send_event(KeyEvent, KeyEvent(e.key, e.scancode, e.unicode, False))
 
         # 清屏
         screen.fill((40,40,40))
 
         ctx.event_manager.before_render()
-        def render(u: ILoveUI):
-            test_screen_content(u, clock.get_fps())
-        ctx.render_in(screen_rect, render)
+        ctx.render_in(screen_rect, lambda u: test_screen_content(u, clock.get_fps()))
 
         # 刷新屏幕
         pygame.display.flip()
