@@ -507,7 +507,17 @@ class Modifying:
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
-    def tag(self, u: 'ILoveUI', tag_str: str, id: UIPath | None = None, with_spacing: bool = True, min_size: float = 0) -> Self:
+    def tag_up(self, u: 'ILoveUI', tag_str: str, id: UIPath | None = None) -> Self:
+        p = self.placeable
+
+        def box_content(u: ILoveUI):
+            text(u, tag_str, id / 'tag_ui' if id is not None else None)
+            u.element_placeable(p)
+
+        self.placeable = u.context.to_placeable(box_content, box)
+        return self
+
+    def tag_left(self, u: 'ILoveUI', tag_str: str, id: UIPath | None = None, with_spacing: bool = True, min_size: float = 0) -> Self:
         p = self.placeable
 
         def row_content(u: ILoveUI):
@@ -527,6 +537,26 @@ class Modifying:
             u.element_placeable(p).flex()
             text(u, tag_str, id / 'tag_ui' if id is not None else None) \
                 .min_size_xy(min_size, 0)
+
+        self.placeable = u.context.to_placeable(row_content, row)
+        return self
+
+    def tag_left_right(self, u: 'ILoveUI', tag_left_str: str, tag_right_str: str, id: UIPath | None = None, tag_min_size: float = 0) -> Self:
+        p = self.placeable
+
+        def row_content(u: ILoveUI):
+            tag_left_ui = text(u, tag_left_str, id / 'tag_left_str' if id is not None else None) \
+                .min_size_xy(tag_min_size, 0)
+
+            u.element_placeable(p).flex()
+
+            tag_right_ui = text(u, tag_right_str, id / 'tag_right_str' if id is not None else None) \
+                .min_size_xy(tag_min_size, 0)
+
+            mw = max(tag_left_ui.placeable.min_width, tag_right_ui.placeable.min_width)
+            mh = max(tag_left_ui.placeable.min_height, tag_right_ui.placeable.min_height)
+            tag_left_ui.placeable = Placeable(mw, mh, tag_left_ui.placeable.place_fn)
+            tag_right_ui.placeable = Placeable(mw, mh, tag_right_ui.placeable.place_fn)
 
         self.placeable = u.context.to_placeable(row_content, row)
         return self
@@ -1634,7 +1664,7 @@ def number_input(u: ILoveUI, name_tag: str, value_ref: Ref[float], value_text_mi
 
         text(u, str(value_ref.value)) \
             .min_size_xy(value_text_min_width, 0) \
-            .tag(u, name_tag, with_spacing=False)
+            .tag_left(u, name_tag, with_spacing=False)
 
         number_modify_button(u, '>', 1)
 
@@ -2064,12 +2094,10 @@ class RenderLayerManager:
     id: UIPath = field(default_factory=UIPath.root)
 
     def get_mask(self, required_count: int) -> bytearray:
-        current_size = len(self.render_mask)
-        if current_size >= required_count:
-            return self.render_mask
+        deficit = required_count - len(self.render_mask)
+        if deficit > 0:
+            self.render_mask += b'\x00' * deficit
 
-        bytes_extend = b'\x00' * (required_count - current_size)
-        self.render_mask.extend(bytes_extend)
         return self.render_mask
 
     def render_mode_to_list_mapper(self) -> Callable[[list[RenderOperate]], list[RenderOperate]]:
@@ -2127,8 +2155,7 @@ def render_layer_control_ui(u: ILoveUI, max_layer: int, state: RenderLayerManage
 
             slider(u, Ref(lambda: layer, lambda value: set_layer(round(value))), 0, max_layer, check_scissor_rect=False) \
                 .flex() \
-                .tag(u, f'layer: {layer}  ', with_spacing=False, min_size=100) \
-                .tag_right(u, f'  max: {max_layer}', min_size=100) \
+                .tag_left_right(u, f'layer: {layer}  ', f'  max: {max_layer}', tag_min_size=100) \
                 .min_size_xy(280, 0)
 
             text(u, '>') \
@@ -2153,7 +2180,7 @@ def render_layer_control_ui(u: ILoveUI, max_layer: int, state: RenderLayerManage
                 .flex() \
                 .clickable(highlight, flip_mask, check_scissor_rect=False)
 
-        bitmap_ui(u, state.id / 'bitmap_ui', state.render_mask, total_bytes_count=max_layer) \
+        bitmap_ui(u, state.id / 'bitmap_ui', state.render_mask, total_bytes_count=max_layer, row_byte_count=12) \
             .flex(1)
 
     return top_col \
@@ -2163,7 +2190,7 @@ def render_layer_control_ui(u: ILoveUI, max_layer: int, state: RenderLayerManage
 class UIRendererUIState:
     single_step_mode: bool = False
     step: bool = False
-    cached_render_tick_listeners: list[Callable[[], None]] | None = None
+    cached_render_tick_listeners: list[RenderOperate] | None = None
 
     def toggle_mode(self) -> None:
         self.single_step_mode = not self.single_step_mode
@@ -2175,31 +2202,38 @@ def ui_renderer_ui(
     u: ILoveUI,
     state: UIRendererUIState,
     ui: Callable[[ILoveUI], None],
+    ui_u: ILoveUI,
     map_render_tick_listeners: Callable[[list[RenderOperate]], list[RenderOperate]] | None = None,
     rect: Rect | None = None,
 ) -> Modifying:
+    '''
+    用于 ui 调试器
+    '''
 
     def place_component(ctx: PlaceContext) -> list[RenderOperate]:
         '''
         收集绘制指令到 list
         '''
-        p = u.context.to_placeable(ui)
+        p = ui_u.context.to_placeable(ui)
         render_tick_listeners: list[RenderOperate] = []
         p.place_fn(PlaceContext(rect if rect is not None else ctx.rect, ctx.context, render_tick_listeners))
         return render_tick_listeners
 
     def place_fn(ctx: PlaceContext):
-        if not state.single_step_mode:
-            lst = place_component(ctx)
-            state.cached_render_tick_listeners = lst
-        elif state.step:
+        if not state.single_step_mode or state.step:
             state.step = False
             lst = place_component(ctx)
             state.cached_render_tick_listeners = lst
-        else:
-            lst: list[RenderOperateType[Callable[[], None]]] = state.cached_render_tick_listeners # type: ignore
 
-        ctx.deferred_render_tick_listeners += map_render_tick_listeners(lst) if map_render_tick_listeners is not None else lst
+        lst = state.cached_render_tick_listeners
+
+        if lst is None:
+            raise ValueError(lst)
+
+        if map_render_tick_listeners is not None:
+            lst = map_render_tick_listeners(lst)
+
+        ctx.deferred_render_tick_listeners += lst
 
     return u.element(place_fn)
 
@@ -2287,16 +2321,19 @@ def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
 
             render_layer_control_ui(u, max_layer, render_layer_manager)
 
-    outer_popup_manager = PopupManager()
-    inner_popup_manager = PopupManager()
+    debug_ui_u: ILoveUI | None = None
+
     def fast_debug_ui(u: ILoveUI, ctx: FastStartContext) -> None:
         # todo 随意调节窗口大小 [v]
         # todo 暂停, 逐帧推进 [v]
-        # todo 拦截所有事件并提供虚拟手指, 可以精确操控
+        # todo 拦截所有事件并提供虚拟手指, 可以精确操控 [ ]
         # todo 逐层渲染 [v]
-        # todo 渲染剪刀区域
+        # todo 渲染剪刀区域 [ ]
 
-        u.context.set(PopupManager, outer_popup_manager)
+        nonlocal debug_ui_u
+        if debug_ui_u is None:
+            debug_ui_u = ILoveUI(ILoveUIContext(u.context.renderer))
+
         popup_layer(u)
 
         if show_rect and ui_rect is not None:
@@ -2304,34 +2341,19 @@ def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
                 .background(highlight, touch_through=True) \
                 .with_rect(ui_rect)
 
-        def popup_manager_guard_modifier(p: Placeable) -> Placeable:
-            def place_fn(ctx: PlaceContext):
-                u.context.set(PopupManager, inner_popup_manager)
-                ctx.deferred_render_tick(lambda: u.context.set(PopupManager, outer_popup_manager))
-
-                p.place_fn(ctx)
-
-                u.context.set(PopupManager, outer_popup_manager)
-                ctx.deferred_render_tick(lambda: u.context.set(PopupManager, inner_popup_manager))
-
-            return Placeable(p.min_width, p.min_height, place_fn)
-
         @column_content(u)
         def top_column(u: ILoveUI):
 
-            ui_renderer_ui(u, ui_renderer_ui_state, lambda u: ui(u, ctx), map_render_tick_listeners=render_layer_manager.render_mode_to_list_mapper(), rect=ui_rect) \
+            ui_renderer_ui(u, ui_renderer_ui_state, lambda u: ui(u, ctx), debug_ui_u or u, map_render_tick_listeners=render_layer_manager.render_mode_to_list_mapper(), rect=ui_rect) \
                 .flex() \
                 .scissor() \
-                .modifier(popup_manager_guard_modifier)
 
             @row_content(u)
             def control_row(u: ILoveUI):
-                @box_content(u)
-                def scissor_enabled(u: ILoveUI):
-                    text(u, 'scissor')
-                    checkbox(u, id / 'scissor checkbox', Ref(u.context.renderer.get_scissor_enabled, u.context.renderer.set_scissor_enabled))
 
-                scissor_enabled.flex()
+                checkbox(u, id / 'scissor checkbox', Ref(u.context.renderer.get_scissor_enabled, u.context.renderer.set_scissor_enabled)) \
+                    .flex() \
+                    .tag_up(u, 'scissor', id / 'scissor checkbox tag')
 
                 text(u, 'ui rect') \
                     .flex() \
@@ -2608,21 +2630,9 @@ def test_scroll_ui(u: ILoveUI, id: UIPath) -> Modifying:
             .clickable(highlight, lambda _: toast(u, f'element {i}'), background_color=Color(80, 80, 80)) \
             .align_xy(0, 0.5)
 
-    # @column_content(u)
-    # def elements_ui(u: ILoveUI):
-    #     element_id = id / 'scroll_test_elements'
-    #     for i in range(36):
-    #         element_button(u, i, element_id / i)
-
-    # return elements_ui \
-    #     .v_scroll(id / 'scroll_test') \
-    #     .expend_xy(40, 80)
-
     element_id = id / 'scroll_test_elements'
-    # col = lazy_list_column(u, id / 'lazy column', list(range(120)), lambda u, i: element_button(u, i, element_id / i)) \
-        # .expend_xy(40, 80)
 
-    @lazy_list_column_content(u, id / 'lazy column', range(1200000))
+    @lazy_list_column_content(u, id / 'lazy column', range(12000000))
     def element_buttons(u: ILoveUI, i: int) -> Modifying:
         return element_button(u, i, element_id / i)
 
@@ -2648,20 +2658,20 @@ def test_screen_content(u: ILoveUI, fps: float):
     @row_content(u)
     def top_row(u: ILoveUI):
 
-        # test_scroll_ui(u, test_ui_state.ui_root / 'test_scroll_ui')
+        test_scroll_ui(u, test_ui_state.ui_root / 'test_scroll_ui')
 
         @column_content(u)
         def top_column(u: ILoveUI):
             render_time_text(u, test_ui_state.ui_root / 'render_time_text') \
-                .tag(u, 'Render Time: ') \
+                .tag_left(u, 'Render Time: ') \
 
             text(u, f'{fps:.4f}') \
-                .tag(u, 'fps: ')
+                .tag_left(u, 'fps: ')
 
             popup_manager = u.context.remember(PopupManager, PopupManager)
 
             text(u, f'{len(popup_manager.popups)}') \
-                .tag(u, 'popup count: ')
+                .tag_left(u, 'popup count: ')
 
             @row_content(u)
             def buttons_row(u: ILoveUI):
