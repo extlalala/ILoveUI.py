@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from asyncio import CancelledError
 from dataclasses import dataclass, field
 from enum import auto, Enum
-from typing import Any, Callable, Coroutine, Generic, Hashable, Iterable, Literal, Sequence, Self, Sized, TypeVar
+from typing import Any, Callable, Coroutine, Generic, Hashable, Sequence, Self, TypeVar
 
 T = TypeVar('T')
 
@@ -196,10 +196,7 @@ class Ref(Generic[T]):
 
     @staticmethod
     def from_list_slot(lst: list[T], slot_index: int = 0) -> 'Ref[T]':
-        def set_value(value: T):
-            lst[slot_index] = value
-
-        return Ref(lambda: lst[slot_index], set_value)
+        return Ref(lambda: lst[slot_index], lambda value: lst.__setitem__(slot_index, value))
 
     @staticmethod
     def from_attr(obj: Any, attr_name: str) -> 'Ref[T]':
@@ -209,6 +206,16 @@ class Ref(Generic[T]):
     def new_box(initial_value: T) -> 'Ref[T]':
         lst = [initial_value]
         return Ref.from_list_slot(lst)
+
+    def discard_new_value_if_invalid(self, validator: Callable[[T], bool]) -> 'Ref[T]':
+        def set_value(value: T):
+            if validator(value):
+                self.value = value
+
+        return Ref(self.get, set_value)
+
+    def map_input(self, mapper: Callable[[T], T]) -> 'Ref[T]':
+        return Ref(self.get, lambda value: self.set(mapper(value)))
 
 @dataclass(frozen=True, slots=True)
 class Color:
@@ -431,6 +438,19 @@ class Modifying:
                 ctx.context.event_manager.consume_events(NewFingerEvent, lambda e: e.finger.in_rect(ctx, True))
 
             ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, color))
+
+        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        return self
+
+    def foreground(self, color: Color, touch_through: bool = True) -> Self:
+        p = self.placeable
+        def place_fn(ctx: PlaceContext):
+            if not touch_through:
+                ctx.context.event_manager.consume_events(NewFingerEvent, lambda e: e.finger.in_rect(ctx, True))
+
+            ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, color))
+
+            p.place_fn(ctx)
 
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
@@ -1645,20 +1665,22 @@ def slider(u: ILoveUI, value_ref: Ref[float], min_val: float, max_val: float, ch
 
     return u.element(place_fn, 30, 30)
 
-def number_input(u: ILoveUI, name_tag: str, value_ref: Ref[float], value_text_min_width: float = 0, level: int = 2) -> Modifying:
+def number_input(u: ILoveUI, name_tag: str, value_ref: Ref[float], value_text_min_width: float = 0, level: int = 2, step: int = 10) -> Modifying:
     @row_content(u)
     def top_row(u: ILoveUI):
 
         def number_modify_button(u: ILoveUI, show: str, delta_value: int) -> Modifying:
+            def set_value(_) -> None:
+                value_ref.set(value_ref.value + delta_value)
             return text(u, show) \
                 .square_expend() \
-                .clickable(highlight, lambda _: value_ref.set(value_ref.value + delta_value))
+                .clickable(highlight, set_value)
 
         if level >= 3:
-            number_modify_button(u, '<<<', -100)
+            number_modify_button(u, '<<<', -step * step)
 
         if level >= 2:
-            number_modify_button(u, '<<', -10)
+            number_modify_button(u, '<<', -step)
 
         number_modify_button(u, '<', -1)
 
@@ -1669,10 +1691,10 @@ def number_input(u: ILoveUI, name_tag: str, value_ref: Ref[float], value_text_mi
         number_modify_button(u, '>', 1)
 
         if level >= 2:
-            number_modify_button(u, '>>', 10)
+            number_modify_button(u, '>>', step)
 
         if level >= 3:
-            number_modify_button(u, '>>>', 100)
+            number_modify_button(u, '>>>', step * step)
 
     return top_row
 
@@ -1823,12 +1845,161 @@ def render_time_text(u: ILoveUI, id: UIPath) -> Modifying:
     return text(u, f'cur: {state.time_seconds:.4f}s, max: {state.max_time_seconds:.4f}s') \
         .modifier(measure_time_modifier)
 
-def bitmap_ui(
+def bitmap_advanced_ui(
     u: ILoveUI, id: UIPath,
     bitmap: bytearray,
     total_bytes_count: int = -1,
     flip_byte_at: Callable[[int], None] | None = None,
     row_byte_count: int = 8
+) -> Modifying:
+    """
+    高级位图控制组件：
+    - 范围翻转 / 范围填充
+    - 全选、全清、全翻转
+    - 数字输入框控制索引
+    """
+    if total_bytes_count < 0:
+        total_bytes_count = len(bitmap)
+
+    def clamp_start(i: int) -> int:
+        if i > end_ref.value:
+            return end_ref.value
+        return clamp(0, i, total_bytes_count)
+
+    def clamp_end(i: int) -> int:
+        if i < start_ref.value:
+            return start_ref.value
+        return clamp(0, i, total_bytes_count)
+
+    # ======================
+    # 控制面板：数值引用
+    # ======================
+    start_ref = (id / 'start_ref').remember(lambda: Ref.new_box(0).map_input(clamp_start))          # 范围起始
+    end_ref = (id / 'end_ref').remember(lambda: Ref.new_box(total_bytes_count - 1).map_input(clamp_end))  # 范围结束
+
+    # ======================
+    # 基础操作：单个/整行翻转（复用原有逻辑）
+    # ======================
+    def flip_index(index: int) -> None:
+        if 0 <= index < total_bytes_count:
+            if flip_byte_at is None:
+                bitmap[index] = 0 if bitmap[index] != 0 else 1
+            else:
+                flip_byte_at(index)
+
+    # ======================
+    # 高级操作：范围/批量
+    # ======================
+    def reset_range(_) -> None:
+        start_ref.value = 0
+        end_ref.value = total_bytes_count
+
+    def flip_range(_) -> None:
+        """翻转 [start, end] 范围内所有位"""
+        s = int(start_ref.value)
+        e = int(end_ref.value)
+        s = max(0, s)
+        e = min(total_bytes_count - 1, e)
+        for i in range(s, e + 1):
+            flip_index(i)
+
+    def fill_range(val: int) -> None:
+        """填充 [start, end] 为指定值（0/1）"""
+        s = int(start_ref.value)
+        e = int(end_ref.value)
+
+        s = max(0, s)
+        e = min(total_bytes_count - 1, e)
+        for i in range(s, e + 1):
+            if flip_byte_at is None:
+                bitmap[i] = val
+            else:
+                # 如果有自定义翻转，用两次翻转模拟设置值
+                if bitmap[i] != val:
+                    flip_byte_at(i)
+
+    def set_all(_, val: int) -> None:
+        """全部设为 val"""
+        for i in range(total_bytes_count):
+            if flip_byte_at is None:
+                bitmap[i] = val
+            else:
+                if bitmap[i] != val:
+                    flip_byte_at(i)
+
+    def flip_all(_) -> None:
+        """全部翻转"""
+        for i in range(total_bytes_count):
+            flip_index(i)
+
+    highlighted_green = Color(180, 255, 180)
+    highlighted_gray = Color(100, 100, 100)
+
+    def byte_ui_by_index(u: ILoveUI, index: int) -> Modifying:
+        if start_ref.value <= index <= end_ref.value:
+            color = highlighted_green if bitmap[index] != 0 else highlighted_gray
+        else:
+            color = green if bitmap[index] != 0 else gray
+
+        return spacing(u) \
+            .background(color)
+
+    # ======================
+    # 布局：组合所有内容
+    # ======================
+    @column_content(u)
+    def root(u: ILoveUI):
+
+        # 控制面板
+        # ======================
+        # 布局：控制面板行
+        # ======================
+        @row_content(u)
+        def control_panel(u: ILoveUI):
+
+            @column_content(u)
+            def range_column(u: ILoveUI):
+                number_input(u, "Start", start_ref, step=row_byte_count).flex() # type: ignore
+                number_input(u, "End", end_ref, step=row_byte_count).flex() # type: ignore
+
+            range_column.flex()
+
+            @column_content(u)
+            def range_buttons(u: ILoveUI):
+                text(u, "flip range").clickable(highlight, flip_range).flex()
+                text(u, "fill range 0").clickable(highlight, lambda _: fill_range(0)).flex()
+                text(u, "fill range 1").clickable(highlight, lambda _: fill_range(1)).flex()
+
+            range_buttons.flex()
+
+            @column_content(u)
+            def global_buttons(u: ILoveUI):
+                text(u, "flip all").clickable(highlight, flip_all).flex()
+                text(u, "all 1").clickable(highlight, lambda _: set_all(_, 1)).flex()
+                text(u, "all 0").clickable(highlight, lambda _: set_all(_, 0)).flex()
+
+            global_buttons.flex()
+
+        # 分隔线
+        spacing(u, 0, 8)
+
+        # 原始位图UI（完全复用）
+        bitmap_ui(
+            u, id / "bitmap",
+            bitmap, total_bytes_count,
+            flip_byte_at, row_byte_count,
+            byte_ui_by_index=byte_ui_by_index
+        ).flex()
+
+    return root
+
+def bitmap_ui(
+    u: ILoveUI, id: UIPath,
+    bitmap: bytearray,
+    total_bytes_count: int = -1,
+    flip_byte_at: Callable[[int], None] | None = None,
+    row_byte_count: int = 8,
+    byte_ui_by_index: Callable[[ILoveUI, int], Modifying] | None = None
 ) -> Modifying:
     '''
     用 byte 表示 bool
@@ -1842,43 +2013,20 @@ def bitmap_ui(
         else:
             flip_byte_at(index)
 
-    def byte_ui(u: ILoveUI, index: int) -> Modifying:
-        return spacing(u) \
-            .flex() \
-            .clickable(highlight, lambda _: flip_index(index), background_color=green if bitmap[index] != 0 else gray)
+    if byte_ui_by_index is not None:
+        def byte_ui(u: ILoveUI, index: int) -> Modifying:
+            ui = byte_ui_by_index(u, index) \
+                .flex() \
+                .clickable(highlight, lambda _: flip_index(index))
 
-    # @column_content(u)
-    # def byte_rows_col(u: ILoveUI):
-    #     for row_number in range((total_bytes_count + row_byte_count - 1) // row_byte_count):
-    #         row_start_index = row_number * row_byte_count
+            return ui
+    else:
+        def byte_ui(u: ILoveUI, index: int) -> Modifying:
+            ui = spacing(u) \
+                .flex() \
+                .clickable(highlight, lambda _: flip_index(index), background_color=green if bitmap[index] != 0 else gray)
 
-    #         @row_content(u)
-    #         def bytes_row(u: ILoveUI):
-    #             text(u, str(row_start_index), id / row_start_index) \
-    #                 .min_size_xy(40, 0)
-
-    #             for col_number in range(row_byte_count):
-    #                 index = row_start_index + col_number
-
-    #                 if index >= total_bytes_count:
-    #                     spacing(u).flex() # 代替缺失的位参与布局, 保持最后一行布局正常
-    #                     continue
-
-    #                 byte_ui(u, index)
-
-    #             def flip_row(_, row_start_index = row_start_index):
-    #                 for col_number in range(row_byte_count):
-    #                     index = row_start_index + col_number
-    #                     if index < total_bytes_count:
-    #                         flip_index(index)
-
-    #             text(u, 'flip', id / 'flip' / row_start_index) \
-    #                 .min_size_xy(40, 0) \
-    #                 .clickable(highlight, flip_row)
-
-    #         bytes_row \
-    #             .ratio_expend(row_byte_count, 1)
-
+            return ui
 
     row_numbers = range((total_bytes_count + row_byte_count - 1) // row_byte_count)
 
@@ -1887,7 +2035,7 @@ def bitmap_ui(
         row_start_index = row_number * row_byte_count
 
         @row_content(u)
-        def bytes_row(u: ILoveUI):
+        def bytes_row(u: ILoveUI) -> None:
             text(u, str(row_start_index), id / row_start_index) \
                 .min_size_xy(40, 0)
 
@@ -1900,7 +2048,7 @@ def bitmap_ui(
 
                 byte_ui(u, index)
 
-            def flip_row(_, row_start_index = row_start_index):
+            def flip_row(_, row_start_index = row_start_index) -> None:
                 for col_number in range(row_byte_count):
                     index = row_start_index + col_number
                     if index < total_bytes_count:
@@ -1911,7 +2059,7 @@ def bitmap_ui(
                 .clickable(highlight, flip_row)
 
         return bytes_row \
-            .ratio_expend(row_byte_count, 1) \
+            .ratio_expend(row_byte_count, 1)
 
     return byte_rows_col
 
@@ -1924,11 +2072,6 @@ def rgba_color_selector(u: ILoveUI, color_ref: Ref[Color]) -> Modifying:
 
         @column_content(u)
         def rgba_sliders_col(u: ILoveUI):
-            # single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.r, lambda value: color_ref.set(dataclasses.replace(color_ref.value, r=value)))).flex()
-            # single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.g, lambda value: color_ref.set(dataclasses.replace(color_ref.value, g=value)))).flex()
-            # single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.b, lambda value: color_ref.set(dataclasses.replace(color_ref.value, b=value)))).flex()
-            # single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.a, lambda value: color_ref.set(dataclasses.replace(color_ref.value, a=value)))).flex()
-
             c = color_ref.value
             single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.r, lambda value: color_ref.set(Color(value, c.g, c.b, c.a)))).flex()
             single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.g, lambda value: color_ref.set(Color(c.r, value, c.b, c.a)))).flex()
@@ -2090,13 +2233,13 @@ class RenderLayerMode(Enum):
 class RenderLayerManager:
     layer: int = 10
     render_mode: RenderLayerMode = RenderLayerMode.all
-    render_mask: bytearray = field(default_factory=lambda: bytearray(512))
+    render_mask: bytearray = field(default_factory=lambda: bytearray(b'\xFF' * 512))
     id: UIPath = field(default_factory=UIPath.root)
 
     def get_mask(self, required_count: int) -> bytearray:
         deficit = required_count - len(self.render_mask)
         if deficit > 0:
-            self.render_mask += b'\x00' * deficit
+            self.render_mask += b'\xFF' * deficit
 
         return self.render_mask
 
@@ -2180,7 +2323,7 @@ def render_layer_control_ui(u: ILoveUI, max_layer: int, state: RenderLayerManage
                 .flex() \
                 .clickable(highlight, flip_mask, check_scissor_rect=False)
 
-        bitmap_ui(u, state.id / 'bitmap_ui', state.render_mask, total_bytes_count=max_layer, row_byte_count=12) \
+        bitmap_advanced_ui(u, state.id / 'bitmap_ui', state.render_mask, total_bytes_count=max_layer, row_byte_count=12) \
             .flex(1)
 
     return top_col \
@@ -2622,13 +2765,10 @@ def fruits_ui(u: ILoveUI, id: UIPath, fruits_lst: list[str], selected_index: Ref
         .expend_xy(0, 20)
 
 def test_scroll_ui(u: ILoveUI, id: UIPath) -> Modifying:
-    rendered_element_count = 0
     def element_button(u: ILoveUI, i: int, id: UIPath) -> Modifying:
-        nonlocal rendered_element_count
-        rendered_element_count += 1
         return text(u, f'element {i}', id) \
             .clickable(highlight, lambda _: toast(u, f'element {i}'), background_color=Color(80, 80, 80)) \
-            .align_xy(0, 0.5)
+            .align_xy(0, None)
 
     element_id = id / 'scroll_test_elements'
 
@@ -2745,10 +2885,6 @@ def test_screen_content(u: ILoveUI, fps: float):
                 click_inc_number_button(u, id / 'click_inc_number_button 2').flex()
 
             stateful_test_row.expend_xy(0, 20)
-
-            bitmap = (test_ui_state.ui_root / 'bitmap').remember(lambda: bytearray(60))
-            bitmap_ui(u, test_ui_state.ui_root / 'bitmap_ui', bitmap) \
-                .flex()
 
         top_column.flex()
 
