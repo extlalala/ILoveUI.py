@@ -8,9 +8,18 @@ from abc import ABC, abstractmethod
 from asyncio import CancelledError
 from dataclasses import dataclass, field
 from enum import auto, Enum
-from typing import Any, Callable, Coroutine, Generic, Hashable, Literal, Self, TypeVar
+from typing import Any, Callable, Coroutine, Generic, Hashable, Iterable, Literal, Sequence, Self, Sized, TypeVar
 
 T = TypeVar('T')
+
+# ==================== utils ====================
+
+def clamp(min_value: T, value: T, max_value: T) -> T:
+    if value < min_value: # type: ignore
+        return min_value
+    if max_value < value: # type: ignore
+        return max_value
+    return value
 
 # ==================== state ====================
 
@@ -267,6 +276,9 @@ class Rect:
         return Rect(inter_x, inter_y, inter_w, inter_h)
 
 class Renderer(ABC):
+    def get_scissor_enabled(self) -> bool: ...
+    def set_scissor_enabled(self, value: bool): ...
+
     def contains_point(self, x: float, y: float) -> bool:
         scissor = self.scissor_rect
         return scissor is None or scissor.contains_point(x, y)
@@ -423,7 +435,7 @@ class Modifying:
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
-    def clickable(self, hover_color: Color | None, click_callback: Callable[[Finger], None], check_scissor_rect: bool = True) -> Self:
+    def clickable(self, hover_color: Color | None, click_callback: Callable[[Finger], None], background_color: Color | None = None, check_scissor_rect: bool = True) -> Self:
         p = self.placeable
         def place_fn(ctx: PlaceContext):
             def consume_new_finger_event(e: NewFingerEvent) -> bool:
@@ -444,6 +456,9 @@ class Modifying:
                 ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, hover_color)) # type: ignore
 
             p.place_fn(ctx)
+
+            if background_color is not None:
+                ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, background_color)) # type: ignore
 
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
@@ -648,22 +663,26 @@ class Modifying:
         self,
         id: UIPath,
         friction: float = 0.92,
-        mouse_wheel_speed: float = -10,
+        mouse_wheel_speed: float = -8,
         scissor: bool = True,
+        out_scope: 'ScrollScope | None' = None
     ) -> Self:
         p = self.placeable
-        self.placeable = scroll_modifier(id, p, horizontal=False, friction=friction, mouse_wheel_speed=mouse_wheel_speed, scissor=scissor)
+        state = id.remember(ScrollState)
+        self.placeable = scroll_modifier(state, p, horizontal=False, friction=friction, mouse_wheel_speed=mouse_wheel_speed, scissor=scissor, out_scope=out_scope)
         return self
 
     def h_scroll(
         self,
         id: UIPath,
         friction: float = 0.92,
-        mouse_wheel_speed: float = -10,
+        mouse_wheel_speed: float = -8,
         scissor: bool = True,
+        out_scope: 'ScrollScope | None' = None
     ) -> Self:
         p = self.placeable
-        self.placeable = scroll_modifier(id, p, horizontal=True, friction=friction, mouse_wheel_speed=mouse_wheel_speed, scissor=scissor)
+        state = id.remember(ScrollState)
+        self.placeable = scroll_modifier(state, p, horizontal=True, friction=friction, mouse_wheel_speed=mouse_wheel_speed, scissor=scissor, out_scope=out_scope)
         return self
 
 @dataclass(slots=True)
@@ -676,16 +695,21 @@ class ScrollState:
     last_time: float = 0
     dragging: bool = False
 
+@dataclass(slots=True)
+class ScrollScope:
+    viewport_offset: float = 0
+    viewport_length: float = float('inf')
+
 def scroll_modifier(
-    id: UIPath,
+    state: ScrollState,
     element_ui: Placeable,
     horizontal: bool = False,
     friction: float = 0.92,
-    mouse_wheel_speed: float = -10,
+    mouse_wheel_speed: float = -8,
     scissor: bool = True,
-    check_scissor_rect: bool = True
+    check_scissor_rect: bool = True,
+    out_scope: ScrollScope | None = None
 ) -> Placeable:
-    state = id.remember(ScrollState)
 
     def place_fn(ctx: PlaceContext):
         nonlocal element_ui
@@ -738,6 +762,11 @@ def scroll_modifier(
                 ctx.rect.w,
                 total_content_size,
             )
+
+        if out_scope is not None:
+            out_scope.viewport_offset = state.scroll
+            out_scope.viewport_length = ctx.rect.w if horizontal else ctx.rect.h
+
         child_ctx = PlaceContext(content_rect, ctx.context, ctx.deferred_render_tick_listeners)
 
         if scissor:
@@ -745,7 +774,7 @@ def scroll_modifier(
             ctx.deferred_render_tick(lambda: ctx.context.renderer.pop_scissor(), RenderOperateType.scissor_op) # defer 从下到上执行
 
         # if scissor:
-            # element_ui = Modifying(element_ui).scissor().placeable # todo why
+        #     element_ui = Modifying(element_ui).scissor().placeable # todo why
 
         element_ui.place_fn(child_ctx)
 
@@ -1134,6 +1163,99 @@ def window(
         content_ui.with_rect(Rect(rect_x, rect_y, min_w, min_h))
 
 # ==================== layouts ====================
+
+def lazy_list_column_content(
+    u: ILoveUI, id: UIPath,
+    lst: Sequence[T],
+    list_spacing: float = 4
+) -> Callable[[Callable[[ILoveUI, T], Modifying]], Modifying]:
+    def decorator(lst_element_ui: Callable[[ILoveUI, T], Modifying]) -> Modifying:
+        return lazy_list_column(u, id, lst, lst_element_ui=lst_element_ui, list_spacing=list_spacing)
+    return decorator
+
+def lazy_list_row_content(
+    u: ILoveUI, id: UIPath,
+    lst: Sequence[T],
+    list_spacing: float = 4
+) -> Callable[[Callable[[ILoveUI, T], Modifying]], Modifying]:
+    def decorator(lst_element_ui: Callable[[ILoveUI, T], Modifying]) -> Modifying:
+        return lazy_list_row(u, id, lst, lst_element_ui=lst_element_ui, list_spacing=list_spacing)
+    return decorator
+
+def lazy_list_column(
+    u: ILoveUI, id: UIPath,
+    lst: Sequence[T],
+    lst_element_ui: Callable[[ILoveUI, T], Modifying],
+    list_spacing: float = 4
+) -> Modifying:
+    return lazy_list_linear(u, id, lst, horizontal=False, lst_element_ui=lst_element_ui, list_spacing=list_spacing)
+
+def lazy_list_row(
+    u: ILoveUI, id: UIPath,
+    lst: Sequence[T],
+    lst_element_ui: Callable[[ILoveUI, T], Modifying],
+    list_spacing: float = 4
+) -> Modifying:
+    return lazy_list_linear(u, id, lst, horizontal=True, lst_element_ui=lst_element_ui, list_spacing=list_spacing)
+
+LAZY_LIST_TRY_RENDER_COUNT = 4
+LAZY_LIST_TAIL_SPACING = 400
+
+@dataclass(slots=True)
+class LazyListState:
+    first: bool = True
+    scroll_scope: ScrollScope = field(default_factory=ScrollScope)
+    element_size: float = -1
+    scroll_state: ScrollState = field(default_factory=ScrollState)
+
+def lazy_list_linear(
+    u: ILoveUI, id: UIPath,
+    lst: Sequence[T],
+    horizontal: bool,
+    lst_element_ui: Callable[[ILoveUI, T], Modifying],
+    list_spacing: float = 4
+) -> Modifying:
+    state = (id / 'lazy_list_state').remember(LazyListState)
+
+    if state.first:
+        state.first = False
+        def linear_content(u: ILoveUI):
+            for i in range(min(LAZY_LIST_TRY_RENDER_COUNT, len(lst))):
+                ui = lst_element_ui(u, lst[i])
+                element_min_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
+                if i == 0:
+                    state.element_size = element_min_size + list_spacing
+                else:
+                    state.element_size = (state.element_size + element_min_size + list_spacing) / 2
+    else:
+        def linear_content(u: ILoveUI):
+            offset = int(state.scroll_scope.viewport_offset // state.element_size)
+            offset = clamp(0, offset, len(lst))
+            length = int((state.scroll_scope.viewport_length + state.element_size - 1) // state.element_size)
+            length = clamp(0, length, len(lst) - offset)
+
+            pad_head = offset * state.element_size
+            if horizontal:
+                spacing(u, pad_head, 0)
+            else:
+                spacing(u, 0, pad_head)
+
+            for i in range(offset, offset + length):
+                ui = lst_element_ui(u, lst[i])
+                element_min_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
+                state.element_size = (state.element_size + element_min_size + list_spacing) / 2
+
+            if offset + length < len(lst):
+                if horizontal:
+                    spacing(u, LAZY_LIST_TAIL_SPACING, 0)
+                else:
+                    spacing(u, 0, LAZY_LIST_TAIL_SPACING)
+
+    ui = linear(u, horizontal=horizontal, content=linear_content, spacing=list_spacing)
+
+    ui.placeable = scroll_modifier(state.scroll_state, ui.placeable, horizontal=horizontal, out_scope=state.scroll_scope)
+
+    return ui
 
 def memo_content(
     u: ILoveUI,
@@ -1528,8 +1650,7 @@ def number_pad(u: ILoveUI, number_typed: Callable[[int], None], id: UIPath | Non
     def number_button(u: ILoveUI, number: int) -> Modifying:
         return text(u, str(number), id = id / number if id is not None else None) \
             .flex() \
-            .background(Color(40, 40, 40)) \
-            .clickable(highlight, lambda _: number_typed(number))
+            .clickable(highlight, lambda _: number_typed(number), background_color=Color(40, 40, 40))
 
     def number_row(u: ILoveUI, n1: int, n2: int, n3: int) -> Modifying:
         @row_content(u)
@@ -1643,8 +1764,7 @@ def rect_control_ui(u: ILoveUI, rect_ref: Ref[Rect]) -> Modifying:
 def window_close_button(u: ILoveUI, close_window: Callable[[], None]) -> Modifying:
     return text(u, 'x') \
         .square_expend() \
-        .background(Color(255, 80, 80)) \
-        .clickable(highlight, lambda _: close_window()) \
+        .clickable(highlight, lambda _: close_window(), background_color=Color(255, 80, 80)) \
         .align_xy(1, 0)
 
 @dataclass(slots=True)
@@ -1695,43 +1815,75 @@ def bitmap_ui(
     def byte_ui(u: ILoveUI, index: int) -> Modifying:
         return spacing(u) \
             .flex() \
-            .background(green if bitmap[index] != 0 else gray) \
-            .clickable(highlight, lambda _: flip_index(index))
+            .clickable(highlight, lambda _: flip_index(index), background_color=green if bitmap[index] != 0 else gray)
 
-    @column_content(u)
-    def byte_rows_col(u: ILoveUI):
-        for row_number in range((total_bytes_count + row_byte_count - 1) // row_byte_count):
-            row_start_index = row_number * row_byte_count
+    # @column_content(u)
+    # def byte_rows_col(u: ILoveUI):
+    #     for row_number in range((total_bytes_count + row_byte_count - 1) // row_byte_count):
+    #         row_start_index = row_number * row_byte_count
 
-            @row_content(u)
-            def bytes_row(u: ILoveUI):
-                text(u, str(row_start_index), id / row_start_index) \
-                    .min_size_xy(40, 0)
+    #         @row_content(u)
+    #         def bytes_row(u: ILoveUI):
+    #             text(u, str(row_start_index), id / row_start_index) \
+    #                 .min_size_xy(40, 0)
 
+    #             for col_number in range(row_byte_count):
+    #                 index = row_start_index + col_number
+
+    #                 if index >= total_bytes_count:
+    #                     spacing(u).flex() # 代替缺失的位参与布局, 保持最后一行布局正常
+    #                     continue
+
+    #                 byte_ui(u, index)
+
+    #             def flip_row(_, row_start_index = row_start_index):
+    #                 for col_number in range(row_byte_count):
+    #                     index = row_start_index + col_number
+    #                     if index < total_bytes_count:
+    #                         flip_index(index)
+
+    #             text(u, 'flip', id / 'flip' / row_start_index) \
+    #                 .min_size_xy(40, 0) \
+    #                 .clickable(highlight, flip_row)
+
+    #         bytes_row \
+    #             .ratio_expend(row_byte_count, 1)
+
+
+    row_numbers = range((total_bytes_count + row_byte_count - 1) // row_byte_count)
+
+    @lazy_list_column_content(u, id / 'lazy_list_column_content', row_numbers)
+    def byte_rows_col(u: ILoveUI, row_number: int) -> Modifying:
+        row_start_index = row_number * row_byte_count
+
+        @row_content(u)
+        def bytes_row(u: ILoveUI):
+            text(u, str(row_start_index), id / row_start_index) \
+                .min_size_xy(40, 0)
+
+            for col_number in range(row_byte_count):
+                index = row_start_index + col_number
+
+                if index >= total_bytes_count:
+                    spacing(u).flex() # 代替缺失的位参与布局, 保持最后一行布局正常
+                    continue
+
+                byte_ui(u, index)
+
+            def flip_row(_, row_start_index = row_start_index):
                 for col_number in range(row_byte_count):
                     index = row_start_index + col_number
+                    if index < total_bytes_count:
+                        flip_index(index)
 
-                    if index >= total_bytes_count:
-                        spacing(u).flex() # 代替缺失的位参与布局, 保持最后一行布局正常
-                        continue
+            text(u, 'flip', id / 'flip' / row_start_index) \
+                .min_size_xy(40, 40) \
+                .clickable(highlight, flip_row)
 
-                    byte_ui(u, index)
+        return bytes_row \
+            .ratio_expend(row_byte_count, 1) \
 
-                def flip_row(_, row_start_index = row_start_index):
-                    for col_number in range(row_byte_count):
-                        index = row_start_index + col_number
-                        if index < total_bytes_count:
-                            flip_index(index)
-
-                text(u, 'flip', id / 'flip' / row_start_index) \
-                    .min_size_xy(40, 0) \
-                    .clickable(highlight, flip_row)
-
-            bytes_row \
-                .ratio_expend(row_byte_count, 1) \
-
-    return byte_rows_col \
-        .v_scroll(id / 'scroll')
+    return byte_rows_col
 
 def single_component_rgba_color_selector(u: ILoveUI, component_ref: Ref[int]) -> Modifying:
     return slider(u, Ref(component_ref.get, lambda value: component_ref.set(int(value))), 0, 255)
@@ -1784,6 +1936,7 @@ class PygameILoveUIRenderer(Renderer):
         # 每个元素：(original_rect: Rect, effective_rect: Rect | None)
         # effective_rect = 上一层裁剪 ∩ 当前 push 的矩形（嵌套生效）
         self.scissor_stack: list[Rect] = []
+        self.scissor_enabled = True
 
     def _bilt_screen(self):
         self.screen_surface.blit(self.buffer_surface, (0, 0))
@@ -1850,8 +2003,8 @@ class PygameILoveUIRenderer(Renderer):
         # 入栈
         self.scissor_stack.append(effective_rect)
         # 应用最终裁剪
-        if for_render:
-            self.screen_surface.set_clip(effective_rect.to_tuple() if effective_rect is not None else None)
+        if for_render and self.scissor_enabled:
+            self.screen_surface.set_clip(effective_rect.to_tuple())
 
     def pop_scissor(self) -> None:
         if not self.scissor_stack:
@@ -1860,12 +2013,13 @@ class PygameILoveUIRenderer(Renderer):
         # 弹出栈顶
         self.scissor_stack.pop()
 
-        # 恢复新的栈顶裁剪
-        if self.scissor_stack:
-            new_top_effective = self.scissor_stack[-1]
-            self.screen_surface.set_clip(new_top_effective.to_tuple() if new_top_effective is not None else None)
-        else:
-            self.screen_surface.set_clip(None)
+        if self.scissor_enabled:
+            # 恢复新的栈顶裁剪
+            if self.scissor_stack:
+                new_top_effective = self.scissor_stack[-1]
+                self.screen_surface.set_clip(new_top_effective.to_tuple())
+            else:
+                self.screen_surface.set_clip(None)
 
     @property
     def scissor_rect(self) -> Rect | None:
@@ -1873,6 +2027,18 @@ class PygameILoveUIRenderer(Renderer):
 
     def get_scissor_count(self) -> int:
         return len(self.scissor_stack)
+
+    def get_scissor_enabled(self) -> bool:
+        return self.scissor_enabled
+
+    def set_scissor_enabled(self, value: bool) -> None:
+        self.scissor_enabled = value
+        if value:
+            if self.scissor_stack:
+                new_top_effective = self.scissor_stack[-1]
+                self.screen_surface.set_clip(new_top_effective.to_tuple())
+        else:
+            self.screen_surface.set_clip(None)
 
 
 # ==================== fast debug ====================
@@ -1910,31 +2076,32 @@ class RenderLayerManager:
         match self.render_mode:
             case RenderLayerMode.all:
                 return lambda x: x
+
             case RenderLayerMode.exactly:
                 def exactly_mapper(lst: list[RenderOperate]) -> list[RenderOperate]:
                     if self.layer not in range(len(lst)):
                         return []
                     op = lst[self.layer]
-                    if op.type == RenderOperateType.scissor_op:
+                    if op.type == RenderOperateType.scissor_op: # 要么不做 scissor_op, 要么保留所有 scissor_op
                         return []
                     return [op]
                 return exactly_mapper
 
             case RenderLayerMode.before:
                 def before_mapper(lst: list[RenderOperate]) -> list[RenderOperate]:
-                    return [e for i, e in enumerate(lst) if i <= self.layer or e.type == RenderOperateType.scissor_op]
+                    return [e for i, e in enumerate(lst) if i <= self.layer or e.type == RenderOperateType.scissor_op] # 要么不做 scissor_op, 要么保留所有 scissor_op
                 return before_mapper
 
             case RenderLayerMode.after:
                 def after_mapper(lst: list[RenderOperate]) -> list[RenderOperate]:
-                    return [e for i, e in enumerate(lst) if i >= self.layer or e.type == RenderOperateType.scissor_op]
+                    return [e for i, e in enumerate(lst) if i >= self.layer or e.type == RenderOperateType.scissor_op] # 要么不做 scissor_op, 要么保留所有 scissor_op
                 return after_mapper
 
             case RenderLayerMode.mask:
-                def after_mapper(lst: list[RenderOperate]) -> list[RenderOperate]:
+                def mask_mapper(lst: list[RenderOperate]) -> list[RenderOperate]:
                     mask = self.get_mask(len(lst))
-                    return [e for i, e in enumerate(lst) if mask[i] != 0 or e.type == RenderOperateType.scissor_op]
-                return after_mapper
+                    return [e for i, e in enumerate(lst) if mask[i] != 0 or e.type == RenderOperateType.scissor_op] # 要么不做 scissor_op, 要么保留所有 scissor_op
+                return mask_mapper
 
             case _:
                 raise ValueError('unreachable')
@@ -2041,7 +2208,7 @@ def debug_ui_rect_control_ui(u: ILoveUI, ui_rect_ref: Ref[Rect | None], show_rec
     @row_content(u)
     def rect_control_row(u: ILoveUI):
         def get_rect() -> Rect:
-            return ui_rect_ref.value if ui_rect_ref.value is not None else Rect(10, 10, 10, 10)
+            return ui_rect_ref.value if ui_rect_ref.value is not None else Rect(0, 0, 200, 200)
 
         def set_rect(value: Rect) -> None:
             ui_rect_ref.value = value
@@ -2054,12 +2221,10 @@ def debug_ui_rect_control_ui(u: ILoveUI, ui_rect_ref: Ref[Rect | None], show_rec
         @column_content(u)
         def buttons_col(u: ILoveUI):
             text(u, 'show rect') \
-                .background(green if show_rect_ref.value else gray) \
-                .clickable(highlight, flip_show_rect)
+                .clickable(highlight, flip_show_rect, background_color=green if show_rect_ref.value else gray)
 
             text(u, 'reset') \
-                .background(gray) \
-                .clickable(highlight, lambda _: ui_rect_ref.set(None))
+                .clickable(highlight, lambda _: ui_rect_ref.set(None), background_color=gray)
 
         buttons_col.align_xy(None, 0.5)
 
@@ -2076,6 +2241,7 @@ def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
 
     ui_rect: Rect | None = None
     show_rect: bool = True
+    id = UIPath.root()
 
     close_last_ui_rect_control_window: Callable[[], None] | None = None
     def open_ui_rect_control_window(u: ILoveUI):
@@ -2121,6 +2287,8 @@ def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
 
             render_layer_control_ui(u, max_layer, render_layer_manager)
 
+    outer_popup_manager = PopupManager()
+    inner_popup_manager = PopupManager()
     def fast_debug_ui(u: ILoveUI, ctx: FastStartContext) -> None:
         # todo 随意调节窗口大小 [v]
         # todo 暂停, 逐帧推进 [v]
@@ -2128,26 +2296,43 @@ def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
         # todo 逐层渲染 [v]
         # todo 渲染剪刀区域
 
-        popup_manager = u.context.remember(PopupManager, PopupManager)
-
-        popup_manager.enabled = True
+        u.context.set(PopupManager, outer_popup_manager)
         popup_layer(u)
-        popup_manager.enabled = False
 
         if show_rect and ui_rect is not None:
             spacing(u) \
                 .background(highlight, touch_through=True) \
                 .with_rect(ui_rect)
 
+        def popup_manager_guard_modifier(p: Placeable) -> Placeable:
+            def place_fn(ctx: PlaceContext):
+                u.context.set(PopupManager, inner_popup_manager)
+                ctx.deferred_render_tick(lambda: u.context.set(PopupManager, outer_popup_manager))
+
+                p.place_fn(ctx)
+
+                u.context.set(PopupManager, outer_popup_manager)
+                ctx.deferred_render_tick(lambda: u.context.set(PopupManager, inner_popup_manager))
+
+            return Placeable(p.min_width, p.min_height, place_fn)
+
         @column_content(u)
         def top_column(u: ILoveUI):
 
             ui_renderer_ui(u, ui_renderer_ui_state, lambda u: ui(u, ctx), map_render_tick_listeners=render_layer_manager.render_mode_to_list_mapper(), rect=ui_rect) \
                 .flex() \
-                .scissor()
+                .scissor() \
+                .modifier(popup_manager_guard_modifier)
 
             @row_content(u)
             def control_row(u: ILoveUI):
+                @box_content(u)
+                def scissor_enabled(u: ILoveUI):
+                    text(u, 'scissor')
+                    checkbox(u, id / 'scissor checkbox', Ref(u.context.renderer.get_scissor_enabled, u.context.renderer.set_scissor_enabled))
+
+                scissor_enabled.flex()
+
                 text(u, 'ui rect') \
                     .flex() \
                     .clickable(highlight, lambda _: open_ui_rect_control_window(u), check_scissor_rect=False)
@@ -2294,8 +2479,7 @@ def test_animation_button(u: ILoveUI, id: UIPath) -> Modifying:
 
     return text(u, 'animate test', id / 'animate test text') \
         .flex() \
-        .background(Color(100, 100, 100, 255)) \
-        .clickable(highlight, startAnimation) \
+        .clickable(highlight, startAnimation, background_color=Color(100, 100, 100, 255)) \
         .align_xy(state.align, None)
 
 def sleep_button(u: ILoveUI, id: UIPath) -> Modifying:
@@ -2309,14 +2493,12 @@ def sleep_button(u: ILoveUI, id: UIPath) -> Modifying:
 
     return text(u, 'sleep 0.1s') \
         .expend_xy(10, 0) \
-        .background(Color(255, 40, 40) if enable_sleep_ref[0] else Color(80, 80, 80)) \
-        .clickable(highlight, toggle_enable_sleep)
+        .clickable(highlight, toggle_enable_sleep, background_color=Color(255, 40, 40) if enable_sleep_ref[0] else Color(80, 80, 80))
 
 def hello_world_button(u: ILoveUI) -> Modifying:
     return text(u, 'hello world') \
         .expend_xy(10, 0) \
-        .background(Color(100, 100, 100, 255)) \
-        .clickable(highlight, lambda _: toast(u, 'hello'))
+        .clickable(highlight, lambda _: toast(u, 'hello'), background_color=Color(100, 100, 100, 255))
 
 def open_window_button(u: ILoveUI, id: UIPath) -> Modifying:
     rect_ref = (id / 'rect_ref').remember(lambda: Ref.new_box(Rect(0, 0, 100, 100)))
@@ -2381,13 +2563,11 @@ def open_window_button(u: ILoveUI, id: UIPath) -> Modifying:
     def buttons_row(u: ILoveUI):
         text(u, 'window') \
             .expend_xy(10, 0) \
-            .background(Color(100, 100, 100, 255)) \
-            .clickable(highlight, open_window)
+            .clickable(highlight, open_window, background_color=Color(100, 100, 100, 255))
 
         text(u, f'{open_window_count} * window') \
             .expend_xy(10, 0) \
-            .background(Color(100, 100, 100, 255)) \
-            .clickable(highlight, open_more_window)
+            .clickable(highlight, open_more_window, background_color=Color(100, 100, 100, 255))
 
     return buttons_row \
         .getRect(rect_ref)
@@ -2408,8 +2588,7 @@ def fruits_ui(u: ILoveUI, id: UIPath, fruits_lst: list[str], selected_index: Ref
             selected_index.value = fruit_index
 
         return text(u, fruit) \
-            .background(Color(255, 80, 80) if fruit_index == selected_index.value else Color(80, 80, 255)) \
-            .clickable(highlight, set_selected) \
+            .clickable(highlight, set_selected, background_color=Color(255, 80, 80) if fruit_index == selected_index.value else Color(80, 80, 255)) \
             .flex()
 
     @row_content(u)
@@ -2421,20 +2600,33 @@ def fruits_ui(u: ILoveUI, id: UIPath, fruits_lst: list[str], selected_index: Ref
         .expend_xy(0, 20)
 
 def test_scroll_ui(u: ILoveUI, id: UIPath) -> Modifying:
+    rendered_element_count = 0
     def element_button(u: ILoveUI, i: int, id: UIPath) -> Modifying:
+        nonlocal rendered_element_count
+        rendered_element_count += 1
         return text(u, f'element {i}', id) \
-            .background(Color(80, 80, 80)) \
-            .clickable(highlight, lambda _: toast(u, f'element {i}')) \
+            .clickable(highlight, lambda _: toast(u, f'element {i}'), background_color=Color(80, 80, 80)) \
             .align_xy(0, 0.5)
 
-    @column_content(u)
-    def elements_ui(u: ILoveUI):
-        element_id = id / 'scroll_test_elements'
-        for i in range(60):
-            element_button(u, i, element_id / i)
+    # @column_content(u)
+    # def elements_ui(u: ILoveUI):
+    #     element_id = id / 'scroll_test_elements'
+    #     for i in range(36):
+    #         element_button(u, i, element_id / i)
 
-    return elements_ui \
-        .v_scroll(id / 'scroll_test') \
+    # return elements_ui \
+    #     .v_scroll(id / 'scroll_test') \
+    #     .expend_xy(40, 80)
+
+    element_id = id / 'scroll_test_elements'
+    # col = lazy_list_column(u, id / 'lazy column', list(range(120)), lambda u, i: element_button(u, i, element_id / i)) \
+        # .expend_xy(40, 80)
+
+    @lazy_list_column_content(u, id / 'lazy column', range(1200000))
+    def element_buttons(u: ILoveUI, i: int) -> Modifying:
+        return element_button(u, i, element_id / i)
+
+    return element_buttons \
         .expend_xy(40, 80)
 
 @dataclass(slots=True)
@@ -2456,7 +2648,7 @@ def test_screen_content(u: ILoveUI, fps: float):
     @row_content(u)
     def top_row(u: ILoveUI):
 
-        test_scroll_ui(u, test_ui_state.ui_root / 'test_scroll_ui')
+        # test_scroll_ui(u, test_ui_state.ui_root / 'test_scroll_ui')
 
         @column_content(u)
         def top_column(u: ILoveUI):
@@ -2544,7 +2736,7 @@ def test_screen_content(u: ILoveUI, fps: float):
 
             stateful_test_row.expend_xy(0, 20)
 
-            bitmap = (test_ui_state.ui_root / 'bitmap').remember(lambda: bytearray(100))
+            bitmap = (test_ui_state.ui_root / 'bitmap').remember(lambda: bytearray(60))
             bitmap_ui(u, test_ui_state.ui_root / 'bitmap_ui', bitmap) \
                 .flex()
 
