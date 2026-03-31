@@ -31,6 +31,12 @@ A lightweight, immediate-mode GUI framework built with Pygame, designed for rapi
 pip install pygame
 ```
 
+直接运行 .py 文件 / Run main script directly
+
+```bash
+python iloveui.py
+```
+
 ## 最小示例 / Minimal Example
 
 ```python
