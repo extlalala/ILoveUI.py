@@ -1,5 +1,4 @@
 import dataclasses
-import functools
 import pygame
 import random
 import time
@@ -8,7 +7,7 @@ from abc import ABC, abstractmethod
 from asyncio import CancelledError
 from dataclasses import dataclass, field
 from enum import auto, Enum
-from typing import Any, Callable, Coroutine, Generic, Hashable, Sequence, Self, TypeVar
+from typing import Any, Callable, Coroutine, Generator, Generic, Hashable, Iterable, Literal, Sequence, Self, TypeVar
 
 T = TypeVar('T')
 
@@ -20,6 +19,23 @@ def clamp(min_value: T, value: T, max_value: T) -> T:
     if max_value < value: # type: ignore
         return max_value
     return value
+
+# ==================== api collect ====================
+
+list_modifiers: list[Callable] = []
+list_widgets: list[Callable] = []
+
+def modifier_def() -> Callable[[T], T]:
+    def decorator(m):
+        list_modifiers.append(m)
+        return m
+    return decorator
+
+def widget_def() -> Callable[[T], T]:
+    def decorator(m):
+        list_widgets.append(m)
+        return m
+    return decorator
 
 # ==================== state ====================
 
@@ -150,8 +166,14 @@ class Finger:
     x: float
     y: float
 
-    drag_listener: Callable[['Finger'], Any] | None = None
-    release_listener: Callable[['Finger'], Any] | None = None
+    drag_listeners: list[Callable[['Finger'], None]] = field(default_factory=lambda: [])
+    release_listeners: list[Callable[['Finger'], None]] = field(default_factory=lambda: [])
+
+    def on_drag(self, listener: Callable[['Finger'], None]) -> None:
+        self.drag_listeners.append(listener)
+
+    def on_release(self, listener: Callable[['Finger'], None]) -> None:
+        self.release_listeners.append(listener)
 
     def in_rect(self, ctx: 'PlaceContext', check_scissor_rect: bool) -> bool:
         return ((not check_scissor_rect or ctx.context.renderer.contains_point(self.x, self.y)) and
@@ -160,6 +182,10 @@ class Finger:
 @dataclass(slots=True)
 class NewFingerEvent:
     finger: Finger
+
+@dataclass(slots=True)
+class TextInputEvent:
+    text: str
 
 @dataclass(slots=True)
 class KeyEvent:
@@ -207,9 +233,9 @@ class Ref(Generic[T]):
         lst = [initial_value]
         return Ref.from_list_slot(lst)
 
-    def discard_new_value_if_invalid(self, validator: Callable[[T], bool]) -> 'Ref[T]':
+    def filter_input(self, filter_fn: Callable[[T], bool]) -> 'Ref[T]':
         def set_value(value: T):
-            if validator(value):
+            if filter_fn(value):
                 self.value = value
 
         return Ref(self.get, set_value)
@@ -230,6 +256,7 @@ class Color:
 highlight = Color(255, 255, 255, 127)
 green = Color(20, 255, 20)
 gray = Color(20, 20, 20)
+white = Color(255, 255, 255)
 
 @dataclass(frozen=True, slots=True)
 class Rect:
@@ -367,6 +394,10 @@ class Modifying:
     placeable: Placeable
     flex_weight: int = 0
 
+    @classmethod
+    def all_builtin_modifiers(cls) -> Iterable[str]:
+        return filter(lambda s: not s.startswith('_'), dir(cls))
+
     def flex(self, weight: int = 1) -> Self:
         self.flex_weight = weight
         return self
@@ -401,6 +432,7 @@ class Modifying:
         operate_fn(self)
         return self
 
+    @modifier_def()
     def with_rect(self, rect: Rect, component_min_width: float = 10, component_min_height: float = 10) -> Self:
         '''
         直接指定组件的 rect
@@ -408,6 +440,16 @@ class Modifying:
         p = self.placeable
         def place_fn(ctx: PlaceContext):
             p.place_fn(PlaceContext(rect, ctx.context, ctx.deferred_render_tick_listeners))
+        self.placeable = Placeable(component_min_width, component_min_height, place_fn)
+        return self
+
+    @modifier_def()
+    def with_rect_relative(self, rect: Rect, component_min_width: float = 10, component_min_height: float = 10) -> Self:
+        p = self.placeable
+        def place_fn(ctx: PlaceContext):
+            off = ctx.rect
+            new_rect = Rect(rect.x + off.x, rect.y + off.y, rect.w, rect.h)
+            p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
         self.placeable = Placeable(component_min_width, component_min_height, place_fn)
         return self
 
@@ -466,7 +508,7 @@ class Modifying:
                         if e.finger.in_rect(ctx, check_scissor_rect):
                             click_callback(finger)
 
-                    e.finger.release_listener = finger_release_listener
+                    e.finger.on_release(finger_release_listener)
 
                 return in_rect
 
@@ -499,7 +541,7 @@ class Modifying:
                     def release_listener(finger):
                         if e.finger.in_rect(ctx, check_scissor_rect):
                             click_callback(finger)
-                    e.finger.release_listener = release_listener
+                    e.finger.on_release(release_listener)
 
                 return in_rect
 
@@ -596,6 +638,19 @@ class Modifying:
             p.place_fn(ctx)
 
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        return self
+
+    def memo_max_size(self, id: UIPath) -> Self:
+        size_ref = (id / 'size').remember(lambda: Ref[tuple[float, float]].new_box((0, 0)))
+
+        p = self.placeable
+
+        w, h = size_ref.value
+        w = max(w, p.min_width)
+        h = max(h, p.min_height)
+        size_ref.value = (w, h)
+
+        self.placeable = Placeable(w, h, p.place_fn)
         return self
 
     def animated_rect(self, id: UIPath, init_rect: Callable[[Rect], Rect] | None = None, mix_factor: int = 3) -> Self:
@@ -794,9 +849,37 @@ def scroll_modifier(
             state.scroll += d
             state.velocity = d / dt
 
-            return True
+            return d != 0
 
         ctx.context.event_manager.consume_events(ScrollEvent, consume_scroll_event)
+
+        #拖拽
+        def consume_finger(e: NewFingerEvent) -> Literal[False]:
+            in_rect = e.finger.in_rect(ctx, check_scissor_rect)
+            if not in_rect:
+                return False
+
+            def on_drag(f: Finger):
+                f_pos = f.x if horizontal else f.y
+                d = f_pos - state.last_drag
+                state.scroll = state.drag_start_scroll - (f_pos - state.drag_start)
+                state.velocity = -d / dt
+                state.last_drag = f_pos
+
+            def on_release(_):
+                state.dragging = False
+
+            e.finger.on_drag(on_drag)
+            e.finger.on_release(on_release)
+
+            state.dragging = True
+            state.drag_start = e.finger.x if horizontal else e.finger.y
+            state.last_drag = state.drag_start
+            state.drag_start_scroll = state.scroll
+
+            return False # 不消耗事件
+
+        ctx.context.event_manager.consume_events(NewFingerEvent, consume_finger)
 
         if horizontal:
             content_rect = Rect(
@@ -831,33 +914,6 @@ def scroll_modifier(
         if scissor:
             ctx.context.renderer.pop_scissor() # 用于拦截事件
             ctx.deferred_render_tick(lambda: ctx.context.renderer.push_scissor(ctx.rect), RenderOperateType.scissor_op) # defer 从下到上执行
-
-        #拖拽
-        def consume_finger(e: NewFingerEvent) -> bool:
-            in_rect = e.finger.in_rect(ctx, check_scissor_rect)
-            if not in_rect:
-                return False
-
-            def on_drag(f: Finger):
-                f_pos = f.x if horizontal else f.y
-                d = f_pos - state.last_drag
-                state.scroll = state.drag_start_scroll - (f_pos - state.drag_start)
-                state.velocity = -d / dt
-                state.last_drag = f_pos
-
-            def on_release(_):
-                state.dragging = False
-
-            state.dragging = True
-            state.drag_start = e.finger.x if horizontal else e.finger.y
-            state.last_drag = state.drag_start
-            state.drag_start_scroll = state.scroll
-            e.finger.drag_listener = on_drag
-            e.finger.release_listener = on_release
-
-            return True
-
-        ctx.context.event_manager.consume_events(NewFingerEvent, consume_finger)
 
         ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, Color(30, 30, 30)))
 
@@ -1002,10 +1058,9 @@ class Popup:
     def set_to_top(self):
         self.to_top = True
 
+@dataclass(slots=True)
 class PopupManager:
-    def __init__(self) -> None:
-        self.popups: list[Popup] = []
-        self.enabled = True
+    popups: list[Popup] = field(default_factory=lambda: [])
 
     def add(self, popup_content: Callable[[ILoveUI, PopupContext], Any]) -> None:
         self.popups.append(Popup(popup_content))
@@ -1015,9 +1070,6 @@ def popup_layer(u: ILoveUI) -> None:
     在 ui 最上层的第一行调用
     '''
     popupManager = u.context.remember(PopupManager, PopupManager)
-
-    if not popupManager.enabled:
-        return
 
     def box_content(u: ILoveUI):
         to_top_popups: list[Popup] = []
@@ -1061,14 +1113,14 @@ def popup_content(u: ILoveUI) -> Callable[[Callable[[ILoveUI, PopupContext], Non
 def popup(u: ILoveUI, popup_content: Callable[[ILoveUI, PopupContext], Any]) -> None:
     popupManager = u.context.get(PopupManager)
     if popupManager is None:
-        raise ValueError("must call 'popup_layer' before call 'popup'")
+        raise ValueError("must call 'popup_layer' before call 'popup', 在使用 'popup' 前，需要先在 UI 最上层的第一行调用 'popup_layer' 函数")
     popupManager.add(popup_content)
 
 # ==================== popups ====================
 
 TOAST_DURATION_SECONDS = 2
 
-def toast(u: ILoveUI, toast_str: str) -> None:
+def toast(u: ILoveUI, toast_str: str, duration_seconds: float = TOAST_DURATION_SECONDS) -> None:
     create_time = time.time()
     offset = 0
     state = UIPath.root()
@@ -1078,7 +1130,7 @@ def toast(u: ILoveUI, toast_str: str) -> None:
         nonlocal offset
 
         current_time = time.time()
-        if current_time - create_time > TOAST_DURATION_SECONDS:
+        if current_time - create_time > duration_seconds:
             ctx.close()
 
         t = text(u, toast_str, state / 'toast_str')
@@ -1138,13 +1190,27 @@ def window_content(
     initial_x: float = 100,
     initial_y: float = 200,
     layout: Callable[[ILoveUI, Callable[[ILoveUI], None]], Modifying] | None = None,
-    with_close_button: bool = True
+    with_close_button: bool = True,
+    single_window_key: UIPath | None = None,
 ) -> Callable[[Callable[[ILoveUI, PopupContext], None]], None]:
     def decorator(content: Callable[[ILoveUI, PopupContext], None]) -> None:
-        window(u, content, initial_x, initial_y, layout, with_close_button)
+        window(u, content, initial_x, initial_y, layout, with_close_button, single_window_key)
     return decorator
 
 WINDOW_FRAME_SIZE = 14
+
+@dataclass(slots=True)
+class SingleWindowModeSupport:
+    close_last_window: Callable[[], None] | None = None
+
+    def before_create_window(self) -> None:
+        if self.close_last_window is not None:
+            self.close_last_window()
+            self.close_last_window = None
+
+    def window_running(self, popup_ctx: PopupContext) -> None:
+        if self.close_last_window is None:
+            self.close_last_window = popup_ctx.close
 
 def window(
     u: ILoveUI,
@@ -1152,10 +1218,17 @@ def window(
     initial_x: float = 100,
     initial_y: float = 200,
     layout: Callable[[ILoveUI, Callable[[ILoveUI], None]], Modifying] | None = None,
-    with_close_button: bool = True
+    with_close_button: bool = True,
+    single_window_key: UIPath | None = None,
 ) -> None:
     if layout is None:
         layout = box
+
+    if single_window_key is None:
+        single_window_mode = None
+    else:
+        single_window_mode = (single_window_key / 'close_last_window').remember(SingleWindowModeSupport)
+        single_window_mode.before_create_window()
 
     rect_x = initial_x
     rect_y = initial_y
@@ -1177,7 +1250,7 @@ def window(
                         rect_x = finger.x - offset_x
                         rect_y = finger.y - offset_y
 
-                    e.finger.drag_listener = finger_drag_listener
+                    e.finger.on_drag(finger_drag_listener)
 
                 return in_rect
 
@@ -1197,15 +1270,21 @@ def window(
             old_content(u, ctx)
         content = wrapped_content
 
+    frame_color = Color(80, 80, 80)
+    bg_color = Color(40, 40, 40)
+
     @popup_content(u)
     def window_popup(u: ILoveUI, ctx: PopupContext) -> None:
+        if single_window_mode is not None:
+            single_window_mode.window_running(ctx)
+
         content_ui = layout(u, lambda u: content(u, ctx))
 
         content_ui \
-            .background(Color(40, 40, 40), touch_through=True) \
+            .background(bg_color, touch_through=True) \
             .padding_xy(WINDOW_FRAME_SIZE, WINDOW_FRAME_SIZE) \
             .modifier(draggable_modifier) \
-            .background(Color(80, 80, 80), touch_through=True) \
+            .background(frame_color, touch_through=True) \
             .on_touchdown(lambda _: ctx.set_to_top()) \
             .animated_rect(state)
 
@@ -1523,11 +1602,11 @@ def spacing_copy_size(u: ILoveUI, copy_size_from: Modifying) -> Modifying:
 def spacing(u: ILoveUI, width: float = 10, height: float = 10) -> Modifying:
     return u.element(lambda _: None, width, height)
 
-def text(u: ILoveUI, s: str, id: UIPath | None = None) -> Modifying:
+def text(u: ILoveUI, s: str, id: UIPath | None = None, color: Color = white) -> Modifying:
     if id is None:
-        text_renderer = u.context.renderer.draw_text(s)
+        text_renderer = u.context.renderer.draw_text(s, color)
     else:
-        text_renderer = id.remember(lambda: u.context.renderer.draw_text(s), valid_key=s)
+        text_renderer = id.remember(lambda: u.context.renderer.draw_text(s, color), valid_key=s)
 
     def place_fn(ctx: PlaceContext):
         ctx.deferred_render_tick(lambda: text_renderer.render(ctx.rect))
@@ -1546,13 +1625,24 @@ class FocusManager:
 class TextFieldState:
     last_blink: float = 0
     blink_state: bool = True
-    last_cursor_pos: float = 0
+    last_cursor_visual_x: float = 0
+    last_cursor_visual_y: float = 0
+    min_width: float = 60
+    min_height: float = 30
+
+    cursor_pos: int = 0
 
     def show_cursor(self) -> None:
         self.last_blink = time.time()
         self.blink_state = True
 
-def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "type something...", check_scissor_rect: bool = True) -> Modifying:
+def get_cursor_prefix(lines: list[str], row: int, col: int) -> str:
+    if not (0 <= row < len(lines)):
+        return ''
+    row_str = lines[row]
+    return row_str[:col]
+
+def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "type something...") -> Modifying:
     focus_manager = u.context.remember(FocusManager, FocusManager)
 
     def add_invisible_unfocus_click_layer():
@@ -1566,35 +1656,77 @@ def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "t
             if focus_manager.focused_ui_path != id:
                 ctx.close()
 
+            ctx.set_to_top()
             spacing(u).on_touchdown(unfocus)
 
     state = id.remember(TextFieldState)
-    min_w = 80
-    min_h = 36
 
     def place_fn(ctx: PlaceContext):
         active = (focus_manager.focused_ui_path == id)
 
         def consume_new_finger_event(e: NewFingerEvent) -> bool:
-            in_rect = e.finger.in_rect(ctx, check_scissor_rect)
+            in_rect = e.finger.in_rect(ctx, True)
             if in_rect and focus_manager.focused_ui_path != id:
                 focus_manager.focused_ui_path = id
+                state.cursor_pos = len(text_ref.value)
                 add_invisible_unfocus_click_layer()
+                state.show_cursor()
 
             return in_rect
-
         ctx.context.event_manager.consume_events(NewFingerEvent, consume_new_finger_event)
 
         if active:
+            def consume_text_input_event(e: TextInputEvent) -> bool:
+                text = text_ref.value
+                # 在光标位置插入字符，而不是追加
+                text_ref.value = text[:state.cursor_pos] + e.text + text[state.cursor_pos:]
+                state.cursor_pos += len(e.text)  # 输入后光标右移
+                state.show_cursor()
+                return True
+            ctx.context.event_manager.consume_events(TextInputEvent, consume_text_input_event)
+
             def consume_key_event(e: KeyEvent) -> bool:
-                if e.isDown and e.keycode == pygame.K_BACKSPACE:
-                    text_ref.value = text_ref.value[:-1]
-                    state.show_cursor()
-                    return True
-                elif e.isDown and e.unicode:
-                    text_ref.value += e.unicode
-                    state.show_cursor()
-                    return True
+                if e.isDown:
+                    text = text_ref.value
+                    # 左箭头：光标左移
+                    if e.keycode == pygame.K_LEFT:
+                        state.cursor_pos = max(0, state.cursor_pos - 1)
+                        state.show_cursor()
+                        return True
+                    # 右箭头：光标右移
+                    elif e.keycode == pygame.K_RIGHT:
+                        state.cursor_pos = min(len(text), state.cursor_pos + 1)
+                        state.show_cursor()
+                        return True
+                    # HOME 键：跳到开头
+                    elif e.keycode == pygame.K_HOME:
+                        state.cursor_pos = 0
+                        state.show_cursor()
+                        return True
+                    # END 键：跳到末尾
+                    elif e.keycode == pygame.K_END:
+                        state.cursor_pos = len(text)
+                        state.show_cursor()
+                        return True
+                    elif e.keycode == pygame.K_RETURN:
+                        text_ref.value = text[:state.cursor_pos] + '\n' + text[state.cursor_pos:]
+                        state.cursor_pos += len('\n')  # 输入后光标右移
+                        state.show_cursor()
+                        return True
+                    # ====================== 精准删除功能 ↓↓↓ ======================
+                    # 退格键：删除光标左侧字符
+                    elif e.keycode == pygame.K_BACKSPACE:
+                        if state.cursor_pos > 0:
+                            text_ref.value = text[:state.cursor_pos-1] + text[state.cursor_pos:]
+                            state.cursor_pos -= 1  # 光标同步左移
+                        state.show_cursor()
+                        return True
+                    # 删除键：删除光标右侧字符
+                    elif e.keycode == pygame.K_DELETE:
+                        if state.cursor_pos < len(text):
+                            text_ref.value = text[:state.cursor_pos] + text[state.cursor_pos+1:]
+                        state.show_cursor()
+                        return True
                 return False
             ctx.context.event_manager.consume_events(KeyEvent, consume_key_event)
 
@@ -1603,33 +1735,62 @@ def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "t
                 state.blink_state = not state.blink_state
                 state.last_blink = now
 
+        lines = (id / 'lines').remember(lambda: text_ref.value.splitlines(), text_ref.value)
+
         def render():
             ctx.context.renderer.fill_rect(ctx.rect, Color(60, 60, 60))
             ctx.context.renderer.fill_rect(ctx.rect, Color(200, 200, 200), line_width = 2 if active else 1)
 
-            s = text_ref.value
-            if not s and not active:
-                textRenderer = ctx.context.renderer.draw_text(placeholder, color=Color(160, 160, 160))
+            if not lines and not active:
+                textRenderers = [ctx.context.renderer.draw_text(placeholder, color=Color(160, 160, 160))]
             else:
-                textRenderer = ctx.context.renderer.draw_text(s)
+                textRenderers = list(map(lambda s: ctx.context.renderer.draw_text(s), lines))
 
             r = ctx.rect
-            textRenderer.render(Rect(r.x+8, r.y + (r.h-textRenderer.min_height)/2, textRenderer.min_width, textRenderer.min_height))
+            y_offset = 0
+            min_w = 60
+            for textRenderer in textRenderers:
+                rect = Rect(r.x+8, y_offset + r.y, textRenderer.min_width, textRenderer.min_height)
+                textRenderer.render(rect)
+                y_offset += textRenderer.min_height
+                min_w = max(min_w, textRenderer.min_width)
 
-            if active:
-                cx = r.x + 8 + textRenderer.min_width + 2
-                last_cx = state.last_cursor_pos
-                cx = (last_cx * 3 + cx) / 4
-                state.last_cursor_pos = cx
+            state.min_width = min_w
+            state.min_height = max(y_offset, 30)
+
+            if active: # todo 优化
+                def mix(a: float, b: float) -> float:
+                    return (a * 3 + b) / 4
+
+                row_number = 0
+                col_number = 0
+                for i in range(min(state.cursor_pos, len(text_ref.value))):
+                    match text_ref.value[i]:
+                        case '\n':
+                            row_number += 1
+                            col_number = 0
+                        case _:
+                            col_number += 1
+
+                cursor_prefix = text_ref.value[state.cursor_pos - col_number:state.cursor_pos]
+                rendered_cursor_prefix = u.context.renderer.draw_text(cursor_prefix)
+                cx = r.x + 8 + rendered_cursor_prefix.min_width
+                cy = r.y + sum(map(lambda n: textRenderers[n].min_height, range(row_number)))
+
+                cx = mix(state.last_cursor_visual_x, cx)
+                cy = mix(state.last_cursor_visual_y, cy)
+
+                state.last_cursor_visual_x = cx
+                state.last_cursor_visual_y = cy
 
                 if state.blink_state:
-                    cy1 = r.y + 6
-                    cy2 = r.y + r.h -6
+                    cy1 = cy
+                    cy2 = cy + rendered_cursor_prefix.min_height
                     ctx.context.renderer.draw_line(Color(255,255,255), (cx, cy1), (cx, cy2), 2)
 
         ctx.deferred_render_tick(render)
 
-    return u.element(place_fn, min_w, min_h)
+    return u.element(place_fn, state.min_width, state.min_height)
 
 def slider(u: ILoveUI, value_ref: Ref[float], min_val: float, max_val: float, check_scissor_rect: bool = True) -> Modifying:
     def place_fn(ctx: PlaceContext):
@@ -1642,7 +1803,7 @@ def slider(u: ILoveUI, value_ref: Ref[float], min_val: float, max_val: float, ch
 
             if in_rect:
                 handle_finger(e.finger)
-                e.finger.drag_listener = handle_finger
+                e.finger.on_drag(handle_finger)
 
             return in_rect
         ctx.context.event_manager.consume_events(NewFingerEvent, consume_new_finger_event)
@@ -1751,8 +1912,8 @@ def touchpad(u: ILoveUI, touchpad_vec: Ref[tuple[float, float]], touchpad_handle
 
                 if in_rect:
                     handle_finger(e.finger)
-                    e.finger.drag_listener = handle_finger
-                    e.finger.release_listener = finger_release_listener
+                    e.finger.on_drag(handle_finger)
+                    e.finger.on_release(finger_release_listener)
 
                 return in_rect
 
@@ -1803,6 +1964,8 @@ def checkbox(u: ILoveUI, id: UIPath, checked: Ref[bool]) -> Modifying:
     return top_box \
         .clickable(None, toggle_checked)
 
+
+
 def rect_control_ui(u: ILoveUI, rect_ref: Ref[Rect]) -> Modifying:
     @column_content(u)
     def control_column(u: ILoveUI):
@@ -1813,11 +1976,57 @@ def rect_control_ui(u: ILoveUI, rect_ref: Ref[Rect]) -> Modifying:
 
     return control_column
 
+
+
 def window_close_button(u: ILoveUI, close_window: Callable[[], None]) -> Modifying:
     return text(u, 'x') \
         .square_expend() \
         .clickable(highlight, lambda _: close_window(), background_color=Color(255, 80, 80)) \
         .align_xy(1, 0)
+
+
+
+def manageable_list(
+    u: ILoveUI,
+    lst: list[T],
+    element_ui: Callable[[ILoveUI, int, T], Modifying],
+    insert_at: Callable[[int], None] | None = None,
+    remove_at: Callable[[int], None] | None = None,
+) -> Modifying:
+
+    def insert_button(u: ILoveUI, idx: int) -> Modifying:
+        return text(u, '+') \
+            .clickable(highlight, lambda _: insert_at(idx)) # type: ignore
+
+
+    def in_list_element_ui(u: ILoveUI, idx: int, e: T) -> Modifying:
+        if remove_at is None:
+            return element_ui(u, idx, e)
+
+        @row_content(u)
+        def with_remove_button_row(u: ILoveUI):
+            text(u, '-') \
+                .clickable(highlight, lambda _: remove_at(idx)) # type: ignore
+
+            element_ui(u, idx, e)
+
+        return with_remove_button_row
+
+
+    @column_content(u)
+    def elements_col(u: ILoveUI):
+        for i, e in enumerate(lst):
+            if insert_at is not None:
+                insert_button(u, i)
+
+            in_list_element_ui(u, i, e)
+
+        if insert_at is not None:
+            insert_button(u, len(lst))
+
+    return elements_col
+
+
 
 @dataclass(slots=True)
 class RenderTimeText:
@@ -1843,7 +2052,10 @@ def render_time_text(u: ILoveUI, id: UIPath) -> Modifying:
         return Placeable(p.min_width, p.min_height, place_fn)
 
     return text(u, f'cur: {state.time_seconds:.4f}s, max: {state.max_time_seconds:.4f}s') \
-        .modifier(measure_time_modifier)
+        .modifier(measure_time_modifier) \
+        .expend_xy(0, 10)
+
+
 
 def bitmap_advanced_ui(
     u: ILoveUI, id: UIPath,
@@ -2006,6 +2218,9 @@ def bitmap_ui(
     '''
     if total_bytes_count < 0:
         total_bytes_count = len(bitmap)
+    else:
+        total_bytes_count = min(total_bytes_count, len(bitmap))
+
 
     def flip_index(index: int) -> None:
         if flip_byte_at is None:
@@ -2094,22 +2309,15 @@ class PygameILoveUIRenderer(Renderer):
     def __init__(
         self,
         screen_surface: pygame.Surface,
-        font: pygame.font.Font | None = None,
-        init_pygame_font: bool = True
     ) -> None:
         super().__init__()
         self.screen_surface = screen_surface
         self.buffer_surface = pygame.Surface(screen_surface.get_size(), pygame.SRCALPHA)
 
-        if init_pygame_font:
-            pygame.font.init()
-
-        self.font = font if font is not None else pygame.font.SysFont(['Arial', 'SimHei'], 24)
-
-        # 每个元素：(original_rect: Rect, effective_rect: Rect | None)
-        # effective_rect = 上一层裁剪 ∩ 当前 push 的矩形（嵌套生效）
         self.scissor_stack: list[Rect] = []
         self.scissor_enabled = True
+
+        self.font = pygame.font.SysFont(['Arial', 'SimHei'], 24)
 
     def _bilt_screen(self):
         self.screen_surface.blit(self.buffer_surface, (0, 0))
@@ -2120,10 +2328,6 @@ class PygameILoveUIRenderer(Renderer):
         sw, sh = self.screen_surface.get_size()
         if bw < sw or bh < sh:
             self.buffer_surface = pygame.Surface((max(bw, sw), max(bh, sh)), pygame.SRCALPHA)
-
-    @functools.lru_cache(maxsize=128)
-    def _text_to_surface(self, s: str, color) -> pygame.Surface:
-        return self.font.render(s, True, color)
 
     def fill_rect(self, rect: Rect, color: Color, line_width: float = 0) -> None:
         color_tuple = color.to_tuple()
@@ -2145,19 +2349,20 @@ class PygameILoveUIRenderer(Renderer):
                 width=int(line_width)
             )
 
-    def draw_text(self, text_str: str, color: Color = Color(255, 255, 255)) -> Renderer.Renderable:
-        text_surf = self._text_to_surface(text_str, color.to_tuple())
-        min_width = text_surf.get_width()
-        min_height = text_surf.get_height()
+
+    def draw_text(self, text_str: str, color: Color = white) -> Renderer.Renderable:
+        surf = self.font.render(text_str, True, color.to_tuple())
+        min_width = surf.get_width()
+        min_height = surf.get_height()
 
         def render(rect: Rect):
-            surf = text_surf
             # 文本居中绘制
             blit_x = rect.x + (rect.w - surf.get_width()) / 2
             blit_y = rect.y + (rect.h - surf.get_height()) / 2
             self.screen_surface.blit(surf, (blit_x, blit_y))
 
         return Renderer.Renderable(min_width, min_height, render)
+
 
     def draw_line(self, color: Color, start_pos: tuple[float, float], end_pos: tuple[float, float], width: int = 1) -> None:
         pygame.draw.line(self.screen_surface, color.to_tuple(), start_pos, end_pos, width)
@@ -2298,7 +2503,7 @@ def render_layer_control_ui(u: ILoveUI, max_layer: int, state: RenderLayerManage
 
             slider(u, Ref(lambda: layer, lambda value: set_layer(round(value))), 0, max_layer, check_scissor_rect=False) \
                 .flex() \
-                .tag_left_right(u, f'layer: {layer}  ', f'  max: {max_layer}', tag_min_size=100) \
+                .tag_left_right(u, f'layer: {layer}  ', f'  {max_layer}', tag_min_size=40) \
                 .min_size_xy(280, 0)
 
             text(u, '>') \
@@ -2313,24 +2518,23 @@ def render_layer_control_ui(u: ILoveUI, max_layer: int, state: RenderLayerManage
 
             text(u, state.render_mode.name) \
                 .flex() \
-                .clickable(highlight, toggle_mode, check_scissor_rect=False)
-
-            def flip_mask(_):
-                for i, e in enumerate(state.render_mask):
-                    state.render_mask[i] = 0 if e != 0 else 1
-
-            text(u, 'flip mask') \
-                .flex() \
-                .clickable(highlight, flip_mask, check_scissor_rect=False)
+                .clickable(highlight, toggle_mode, check_scissor_rect=False) \
+                .tag_left(u, 'layer render mode') \
+                .expend_xy(0, 10)
 
         bitmap_advanced_ui(u, state.id / 'bitmap_ui', state.render_mask, total_bytes_count=max_layer, row_byte_count=12) \
-            .flex(1)
+            .flex() \
+            .background(gray)
 
     return top_col \
         .square_expend()
 
 @dataclass(slots=True)
 class UIRendererUIState:
+    fast_start_ctx: 'FastStartContext'
+    original_target_ui: Callable[[ILoveUI, 'FastStartContext'], None]
+    target_ui: Callable[[ILoveUI, 'FastStartContext'], None]
+    target_ui_u: ILoveUI
     single_step_mode: bool = False
     step: bool = False
     cached_render_tick_listeners: list[RenderOperate] | None = None
@@ -2344,8 +2548,6 @@ class UIRendererUIState:
 def ui_renderer_ui(
     u: ILoveUI,
     state: UIRendererUIState,
-    ui: Callable[[ILoveUI], None],
-    ui_u: ILoveUI,
     map_render_tick_listeners: Callable[[list[RenderOperate]], list[RenderOperate]] | None = None,
     rect: Rect | None = None,
 ) -> Modifying:
@@ -2357,7 +2559,7 @@ def ui_renderer_ui(
         '''
         收集绘制指令到 list
         '''
-        p = ui_u.context.to_placeable(ui)
+        p = state.target_ui_u.context.to_placeable(lambda u: state.target_ui(u, state.fast_start_ctx))
         render_tick_listeners: list[RenderOperate] = []
         p.place_fn(PlaceContext(rect if rect is not None else ctx.rect, ctx.context, render_tick_listeners))
         return render_tick_listeners
@@ -2365,13 +2567,19 @@ def ui_renderer_ui(
     def place_fn(ctx: PlaceContext):
         if not state.single_step_mode or state.step:
             state.step = False
-            lst = place_component(ctx)
+            try:
+                lst = place_component(ctx)
+            except Exception as e:
+                dialog(u, f'{e}, {e.args}', lambda _: None, lambda: True)
+                state.target_ui = state.original_target_ui
+                lst = []
             state.cached_render_tick_listeners = lst
 
         lst = state.cached_render_tick_listeners
 
         if lst is None:
-            raise ValueError(lst)
+            toast(u, 'error', 1)
+            return
 
         if map_render_tick_listeners is not None:
             lst = map_render_tick_listeners(lst)
@@ -2379,7 +2587,6 @@ def ui_renderer_ui(
         ctx.deferred_render_tick_listeners += lst
 
     return u.element(place_fn)
-
 
 def debug_ui_rect_control_ui(u: ILoveUI, ui_rect_ref: Ref[Rect | None], show_rect_ref: Ref[bool]) -> Modifying:
     @row_content(u)
@@ -2407,29 +2614,45 @@ def debug_ui_rect_control_ui(u: ILoveUI, ui_rect_ref: Ref[Rect | None], show_rec
 
     return rect_control_row
 
+def render_code_ui(u: ILoveUI, id: UIPath, target_ui_ref: Ref[Callable[[ILoveUI, 'FastStartContext'], None]]) -> Modifying:
+    code_ref = (id / 'code_ref').remember(lambda: Ref.new_box(''))
+
+    def submit_code(_):
+        try:
+            obj = eval(code_ref.value)
+            target_ui_ref.value = obj
+        except Exception as e:
+            dialog(u, f'{e}, {e.args}', lambda _: None, lambda: True)
+
+    @column_content(u)
+    def top(u: ILoveUI):
+
+        text_field(u, id / 'code input', code_ref) \
+            .flex() \
+            .min_size_xy(0, 1000) \
+            .v_scroll(id / 'scroll')
+
+        text(u, 'submit') \
+            .clickable(highlight, submit_code, gray)
+
+    return top
+
 @dataclass(slots=True)
 class FastStartContext:
     fps: float
 
-def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
+def fast_debug(target_ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
     render_layer_manager = RenderLayerManager()
-    ui_renderer_ui_state = UIRendererUIState()
+    ui_renderer_ui_state: UIRendererUIState | None = None
     color_ref = Ref.new_box(Color(0, 0, 0, 255))
 
     ui_rect: Rect | None = None
     show_rect: bool = True
     id = UIPath.root()
 
-    close_last_ui_rect_control_window: Callable[[], None] | None = None
     def open_ui_rect_control_window(u: ILoveUI):
-        if close_last_ui_rect_control_window is not None:
-            close_last_ui_rect_control_window()
-
-        @window_content(u)
+        @window_content(u, single_window_key=id / 'ui_rect_control_window')
         def ui_rect_control_window(u: ILoveUI, ctx: PopupContext):
-            nonlocal close_last_ui_rect_control_window
-            close_last_ui_rect_control_window = ctx.close
-
             def set_rect(value: Rect | None) -> None:
                 nonlocal ui_rect
                 ui_rect = value
@@ -2438,33 +2661,26 @@ def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
                 show_rect = value
             debug_ui_rect_control_ui(u, Ref(lambda: ui_rect, set_rect), Ref(lambda: show_rect, set_show_rect))
 
-    close_last_color_selector_window: Callable[[], None] | None = None
     def open_color_selector_window(u: ILoveUI):
-        if close_last_color_selector_window is not None:
-            close_last_color_selector_window()
-
-        @window_content(u)
+        @window_content(u, single_window_key=id / 'color_selector_window')
         def color_selector_window(u: ILoveUI, ctx: PopupContext):
-            nonlocal close_last_color_selector_window
-            close_last_color_selector_window = ctx.close
-
             rgba_color_selector(u, color_ref)
 
-    close_last_render_layer_window: Callable[[], None] | None = None
     def open_render_layer_window(u: ILoveUI):
-        if close_last_render_layer_window is not None:
-            close_last_render_layer_window()
-
-        @window_content(u)
+        @window_content(u, single_window_key=id / 'render_layer_window')
         def render_layer_window(u: ILoveUI, ctx: PopupContext):
-            nonlocal close_last_render_layer_window
-            close_last_render_layer_window = ctx.close
-
-            max_layer = len(ui_renderer_ui_state.cached_render_tick_listeners) if ui_renderer_ui_state.cached_render_tick_listeners is not None else 0
-
+            if ui_renderer_ui_state is not None:
+                max_layer = len(ui_renderer_ui_state.cached_render_tick_listeners) if ui_renderer_ui_state.cached_render_tick_listeners is not None else 0
+            else:
+                max_layer = 0
             render_layer_control_ui(u, max_layer, render_layer_manager)
 
-    debug_ui_u: ILoveUI | None = None
+    def open_code_window(u: ILoveUI):
+        @window_content(u, single_window_key=id / 'code_window')
+        def render_layer_window(u: ILoveUI, ctx: PopupContext):
+            if ui_renderer_ui_state is not None:
+                render_code_ui(u, id / 'render_code_ui', Ref.from_attr(ui_renderer_ui_state, UIRendererUIState.target_ui.__name__)) \
+                    .min_size_xy(300, 300)
 
     def fast_debug_ui(u: ILoveUI, ctx: FastStartContext) -> None:
         # todo 随意调节窗口大小 [v]
@@ -2472,10 +2688,14 @@ def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
         # todo 拦截所有事件并提供虚拟手指, 可以精确操控 [ ]
         # todo 逐层渲染 [v]
         # todo 渲染剪刀区域 [ ]
+        # todo 可视化低代码编辑器
 
-        nonlocal debug_ui_u
-        if debug_ui_u is None:
-            debug_ui_u = ILoveUI(ILoveUIContext(u.context.renderer))
+        nonlocal ui_renderer_ui_state
+        if ui_renderer_ui_state is None:
+            target_ui_u = ILoveUI(ILoveUIContext(u.context.renderer))
+            ui_renderer_ui_state = UIRendererUIState(ctx, target_ui, target_ui, target_ui_u)
+        else:
+            ui_renderer_ui_state.fast_start_ctx = ctx
 
         popup_layer(u)
 
@@ -2487,9 +2707,10 @@ def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
         @column_content(u)
         def top_column(u: ILoveUI):
 
-            ui_renderer_ui(u, ui_renderer_ui_state, lambda u: ui(u, ctx), debug_ui_u or u, map_render_tick_listeners=render_layer_manager.render_mode_to_list_mapper(), rect=ui_rect) \
-                .flex() \
-                .scissor() \
+            if ui_renderer_ui_state is not None:
+                ui_renderer_ui(u, ui_renderer_ui_state, map_render_tick_listeners=render_layer_manager.render_mode_to_list_mapper(), rect=ui_rect) \
+                    .flex() \
+                    .scissor()
 
             @row_content(u)
             def control_row(u: ILoveUI):
@@ -2510,13 +2731,18 @@ def fast_debug(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
                     .flex() \
                     .clickable(highlight, lambda _: open_render_layer_window(u), check_scissor_rect=False)
 
-                text(u, 'single step' if ui_renderer_ui_state.single_step_mode else 'run') \
+                text(u, 'code') \
                     .flex() \
-                    .clickable(highlight, lambda _: ui_renderer_ui_state.toggle_mode(), check_scissor_rect=False)
+                    .clickable(highlight, lambda _: open_code_window(u), check_scissor_rect=False)
 
-                text(u, 'stepping' if ui_renderer_ui_state.step else 'step') \
-                    .flex() \
-                    .clickable(highlight, lambda _: ui_renderer_ui_state.toggle_step(), check_scissor_rect=False)
+                if ui_renderer_ui_state is not None:
+                    text(u, 'single step' if ui_renderer_ui_state.single_step_mode else 'run') \
+                        .flex() \
+                        .clickable(highlight, lambda _: ui_renderer_ui_state.toggle_mode() if ui_renderer_ui_state is not None else None, check_scissor_rect=False)
+
+                    text(u, 'stepping' if ui_renderer_ui_state.step else 'step') \
+                        .flex() \
+                        .clickable(highlight, lambda _: ui_renderer_ui_state.toggle_step() if ui_renderer_ui_state is not None else None, check_scissor_rect=False)
 
         spacing(u) \
             .background(color_ref.value)
@@ -2542,6 +2768,8 @@ class FastStart:
         ctx.fingers.append(Finger(0, 0))
         self.ctx = ctx
 
+        pygame.key.set_repeat(320, 50) # todo 这是为了流畅的文本删除, 但是会导致其它键的 KeyDown 事件快速连续触发
+
     def tick(self) -> None:
         if not self.running:
             return
@@ -2554,6 +2782,9 @@ class FastStart:
 
             elif e.type == pygame.VIDEORESIZE:
                 self.screen_rect = Rect(0, 0, e.size[0], e.size[1])
+
+            elif e.type == pygame.TEXTINPUT:
+                self.ctx.event_manager.send_event(TextInputEvent, TextInputEvent(e.text))
 
             elif e.type == pygame.MOUSEWHEEL:
                 mouse_x, mouse_y = pygame.mouse.get_pos()
@@ -2575,8 +2806,8 @@ class FastStart:
                     x, y = e.pos
                     finger.x = x
                     finger.y = y
-                    if finger.drag_listener is not None:
-                        finger.drag_listener(finger)
+                    for listener in finger.drag_listeners:
+                        listener(finger)
 
             elif e.type == pygame.MOUSEBUTTONUP:
                 if len(ctx.fingers) > 0:
@@ -2584,12 +2815,11 @@ class FastStart:
                     x, y = e.pos
                     finger.x = x
                     finger.y = y
-                    finger.drag_listener = None
-                    if finger.release_listener is not None:
-                        finger.release_listener(finger)
-                        finger.release_listener = None
+                    finger.drag_listeners.clear()
+                    for listener in finger.release_listeners:
+                        listener(finger)
+                    finger.release_listeners.clear()
 
-            # 输入框打字
             elif e.type == pygame.KEYDOWN:
                 ctx.event_manager.send_event(KeyEvent, KeyEvent(e.key, e.scancode, e.unicode, True))
 
@@ -2616,6 +2846,209 @@ def fast_start(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
         s.tick()
 
     pygame.quit()
+
+# ==================== visual editor ====================
+
+@dataclass(slots=True)
+class WidgetNode:
+    widget_value: str
+    args: list['ContentNode'] = field(default_factory=lambda: [])
+    modifiers: list['ModifierNode'] = field(default_factory=lambda: [])
+
+@dataclass(slots=True)
+class ModifierNode:
+    modifier_value: str
+
+@dataclass(slots=True)
+class ContentNode:
+    widgets: list['WidgetNode'] = field(default_factory=lambda: [])
+
+
+class VisualTreeDumper:
+    def __init__(self, tag_str: str = '\t') -> None:
+        self.tag_str = tag_str
+
+    def dumpContentStr(self, n: ContentNode) -> str:
+        return '\n'.join(self.dumpContentLines(n))
+
+    def dumpWidgetLines(self, n: WidgetNode) -> Generator[str, None, None]:
+        for i, arg in enumerate(n.args):
+            yield f'def content{i}(u: ILoveUI) -> None:'
+
+            for line in self.dumpContentLines(arg):
+                yield f'{self.tag_str}{line}'
+
+            yield ''
+
+        yield f'{n.widget_value}({", ".join(map(lambda x: f"content{x}", range(len(n.args))))})'
+
+        for modifier in n.modifiers:
+            yield f'{self.tag_str}.{modifier.modifier_value} \\'
+
+    def dumpContentLines(self, n: ContentNode) -> Generator[str, None, None]:
+        for widget in n.widgets:
+            for line in self.dumpWidgetLines(widget):
+                yield self.tag_str + line
+
+            yield ''
+
+
+@dataclass(slots=True)
+class VisualTreeUIStyle:
+    content_bg: Color
+    content_text: Color
+    widget_bg: Color
+    widget_text: Color
+    modifier_bg: Color
+    modifier_text: Color
+
+styles = [
+    VisualTreeUIStyle(
+        Color(220, 240, 255), # （浅天蓝）
+        Color(30, 60, 100), # （深蓝灰）
+        Color(240, 230, 255), # （浅薰衣紫）
+        Color(70, 40, 100), # （深紫灰）
+        Color(235, 250, 235), # （浅薄荷绿）
+        Color(40, 90, 40), # （深墨绿）
+    ),
+    VisualTreeUIStyle(
+        Color(255, 235, 200), # （浅暖橙）
+        Color(120, 60, 0), # （深橙红）
+        Color(255, 220, 230), # （浅柔粉）
+        Color(130, 30, 60), # （深玫红）
+        Color(210, 245, 255), # （浅青蓝）
+        Color(20, 80, 110), # （深海蓝）
+    ),
+    VisualTreeUIStyle(
+        Color(50, 70, 100), # （深灰蓝）
+        Color(245, 245, 255), # （纯白）
+        Color(70, 50, 90), # （深紫灰）
+        Color(245, 245, 255), # （纯白）
+        Color(40, 80, 60), # （深墨绿）
+        Color(245, 245, 255), # （纯白）
+    )
+]
+
+
+@dataclass(slots=True)
+class VisualTreeUI:
+    root_content: ContentNode
+    on_tree_changed: Callable[[], None] = lambda: None
+    single_window_key: UIPath = field(default_factory=UIPath.root)
+    style: VisualTreeUIStyle = field(default_factory=lambda: random.choice(styles))
+
+    def visual_tree_content_ui(self, u: ILoveUI, n: ContentNode) -> Modifying:
+        @row_content(u)
+        def top_row(u: ILoveUI):
+            spacing(u) \
+                .background(self.style.content_bg)
+
+            def insert_at(idx: int):
+                n.widgets.insert(idx, WidgetNode('new widget'))
+                self.on_tree_changed()
+
+            def remove_at(idx: int):
+                del n.widgets[idx]
+                self.on_tree_changed()
+
+            manageable_list(
+                u,
+                n.widgets,
+                element_ui=lambda u, _, e: self.visual_tree_widget_ui(u, e),
+                insert_at=insert_at,
+                remove_at=remove_at,
+            )
+
+        return top_row
+
+
+    def visual_tree_modifier_ui(self, u: ILoveUI, n: ModifierNode) -> Modifying:
+
+        return text(u, n.modifier_value, color=self.style.modifier_text) \
+            .background(self.style.modifier_bg)
+
+
+    def visual_tree_widget_ui(self, u: ILoveUI, n: WidgetNode) -> Modifying:
+        @column_content(u)
+        def top(u: ILoveUI):
+
+            text(u, n.widget_value, color=self.style.widget_text) \
+                .background(self.style.widget_bg)
+
+            @row_content(u)
+            def args_row(u: ILoveUI):
+                text(u, 'args: ', color=self.style.widget_text) \
+                    .background(self.style.widget_bg)
+
+                def insert_at(idx: int):
+                    n.args.insert(idx, ContentNode())
+                    self.on_tree_changed()
+
+                def remove_at(idx: int):
+                    del n.args[idx]
+                    self.on_tree_changed()
+
+                manageable_list(
+                    u,
+                    n.args,
+                    element_ui=lambda u, _, e: self.visual_tree_content_ui(u, e),
+                    insert_at=insert_at,
+                    remove_at=remove_at,
+                )
+
+            @row_content(u)
+            def modifiers_row(u: ILoveUI):
+                text(u, 'modifiers: ', color=self.style.widget_text) \
+                    .background(self.style.widget_bg)
+
+                def insert_at(idx: int):
+                    n.modifiers.insert(idx, ModifierNode('new modifier'))
+                    self.on_tree_changed()
+
+                def remove_at(idx: int):
+                    del n.modifiers[idx]
+                    self.on_tree_changed()
+
+                manageable_list(
+                    u,
+                    n.modifiers,
+                    element_ui=lambda u, _, e: self.visual_tree_modifier_ui(u, e),
+                    insert_at=insert_at,
+                    remove_at=remove_at,
+                )
+
+        return top \
+            .background(gray)
+
+
+
+class VisualEditor:
+    def __init__(self) -> None:
+        self.tree = VisualTreeUI(ContentNode(), on_tree_changed=self.on_tree_changed)
+        self.id = UIPath.root()
+        self.code_text = ''
+
+    def on_tree_changed(self):
+        self.code_text = VisualTreeDumper('    ').dumpContentStr(self.tree.root_content)
+
+    def code_ui(self, u: ILoveUI) -> Modifying:
+        return text_field(u, self.id / 'code_ui text', Ref.from_attr(self, 'code_text')) \
+            .expend_xy(40, 0)
+
+    def visual_editor_ui(self, u: ILoveUI) -> Modifying:
+        @row_content(u)
+        def top_row(u: ILoveUI):
+
+            self.tree.visual_tree_content_ui(u, self.tree.root_content) \
+                .v_scroll(self.id / 'v_scroll') \
+                .h_scroll(self.id / 'h_scroll') \
+                .flex()
+
+            self.code_ui(u)
+
+        return top_row
+
+
 
 # ==================== test ====================
 
@@ -2774,7 +3207,8 @@ def test_scroll_ui(u: ILoveUI, id: UIPath) -> Modifying:
 
     @lazy_list_column_content(u, id / 'lazy column', range(12000000))
     def element_buttons(u: ILoveUI, i: int) -> Modifying:
-        return element_button(u, i, element_id / i)
+        return element_button(u, i, element_id / i) \
+            .expend_xy(0, 10)
 
     return element_buttons \
         .expend_xy(40, 80)
@@ -2803,10 +3237,11 @@ def test_screen_content(u: ILoveUI, fps: float):
         @column_content(u)
         def top_column(u: ILoveUI):
             render_time_text(u, test_ui_state.ui_root / 'render_time_text') \
-                .tag_left(u, 'Render Time: ') \
+                .tag_left(u, 'Render Time: ')
 
             text(u, f'{fps:.4f}') \
-                .tag_left(u, 'fps: ')
+                .tag_left(u, 'fps: ') \
+                .expend_xy(0, 10)
 
             popup_manager = u.context.remember(PopupManager, PopupManager)
 
@@ -2892,7 +3327,13 @@ def test_screen_content(u: ILoveUI, fps: float):
         .animated_rect(test_ui_state.ui_root / 'top_column animate')
 
 def main():
-    fast_debug(lambda u, ctx: test_screen_content(u, ctx.fps))
+    fast_debug(lambda u, ctx: test_screen_content(u, ctx.fps)) # 测试界面 v1
+
+    # v = VisualEditor()
+    # def ui(u: ILoveUI, _):
+        # popup_layer(u)
+        # v.visual_editor_ui(u)
+    # fast_debug(ui)
 
 if __name__ == '__main__':
     main()
