@@ -184,6 +184,10 @@ class NewFingerEvent:
     finger: Finger
 
 @dataclass(slots=True)
+class HoveringEvent:
+    finger: Finger
+
+@dataclass(slots=True)
 class TextInputEvent:
     text: str
 
@@ -233,15 +237,25 @@ class Ref(Generic[T]):
         lst = [initial_value]
         return Ref.from_list_slot(lst)
 
-    def filter_input(self, filter_fn: Callable[[T], bool]) -> 'Ref[T]':
+    def value_changed(self, callback: Callable[[T, T], None]) -> 'Ref[T]':
         def set_value(value: T):
-            if filter_fn(value):
+            old = self.value
+            self.value = value # 回调中可能读取 Ref 的数据源, 并且预期数据源已改变, 所以要先赋值, 再回调
+            callback(old, value)
+
+        return Ref(self.get, set_value)
+
+    def filter_input(self, predicate: Callable[[T], bool]) -> 'Ref[T]':
+        def set_value(value: T):
+            if predicate(value):
                 self.value = value
 
         return Ref(self.get, set_value)
 
     def map_input(self, mapper: Callable[[T], T]) -> 'Ref[T]':
         return Ref(self.get, lambda value: self.set(mapper(value)))
+
+
 
 @dataclass(frozen=True, slots=True)
 class Color:
@@ -257,6 +271,8 @@ highlight = Color(255, 255, 255, 127)
 green = Color(20, 255, 20)
 gray = Color(20, 20, 20)
 white = Color(255, 255, 255)
+
+
 
 @dataclass(frozen=True, slots=True)
 class Rect:
@@ -308,6 +324,8 @@ class Rect:
         inter_h = max(0, inter_bottom - inter_y)
 
         return Rect(inter_x, inter_y, inter_w, inter_h)
+
+
 
 class Renderer(ABC):
     def get_scissor_enabled(self) -> bool: ...
@@ -1386,6 +1404,8 @@ def lazy_list_linear(
 
     return ui
 
+
+
 def memo_content(
     u: ILoveUI,
     id: UIPath,
@@ -1401,6 +1421,7 @@ class Memo:
     memo_placeable: Placeable
     valid_key: Any
     new_memo: bool = True
+    memo_rect: Rect | None = None
 
 def memo(
     u: ILoveUI,
@@ -1409,9 +1430,6 @@ def memo(
     valid_key: Any,
     layout: Callable[[ILoveUI, Callable[[ILoveUI], None]], Modifying] | None = None
 ) -> Modifying:
-    '''
-    memo 的 content 在不更新时无法接收事件
-    '''
     if layout is None:
         layout = box
 
@@ -1426,22 +1444,16 @@ def memo(
         state.valid_key = valid_key
 
     def place_fn(ctx: PlaceContext):
-        def place_component() -> list[RenderOperate]:
-            render_tick_listeners: list[RenderOperate] = []
+        if not state.new_memo and state.memo_rect != ctx.rect:
+            state.memo_placeable = layout_component() # 在矩形变化时重新布局
 
-            # 确保每次 place_component 都对应一次 layout_component
-            if not state.new_memo:
-                state.memo_placeable = layout_component()
-
-            state.new_memo = False
-            state.memo_placeable.place_fn(PlaceContext(ctx.rect, ctx.context, render_tick_listeners))
-            return render_tick_listeners
-
-        render_tick_listeners = (id / 'render_tick_listeners').remember(place_component, (ctx.rect, valid_key))
-
-        ctx.deferred_render_tick_listeners += render_tick_listeners
+        state.memo_rect = ctx.rect
+        state.new_memo = False
+        state.memo_placeable.place_fn(ctx)
 
     return u.element(place_fn, state.memo_placeable.min_width, state.memo_placeable.min_height)
+
+
 
 def box_content(u: ILoveUI) -> Callable[[Callable[[ILoveUI], None]], Modifying]:
     '''
@@ -1931,6 +1943,8 @@ def touchpad(u: ILoveUI, touchpad_vec: Ref[tuple[float, float]], touchpad_handle
         .expend_xy(20, 20) \
         .modifier(touchpad_modifier)
 
+
+
 def checkbox(u: ILoveUI, id: UIPath, checked: Ref[bool]) -> Modifying:
     def toggle_checked(_):
         checked.value = not checked.value
@@ -1992,11 +2006,37 @@ def manageable_list(
     element_ui: Callable[[ILoveUI, int, T], Modifying],
     insert_at: Callable[[int], None] | None = None,
     remove_at: Callable[[int], None] | None = None,
+    swap_at: Callable[[int, int], None] | None = None,
 ) -> Modifying:
 
-    def insert_button(u: ILoveUI, idx: int) -> Modifying:
-        return text(u, '+') \
-            .clickable(highlight, lambda _: insert_at(idx)) # type: ignore
+    def insert_and_swap_button(u: ILoveUI, idx: int) -> Modifying:
+        @row_content(u)
+        def buttons_row(u: ILoveUI):
+            text(u, '+') \
+                .clickable(highlight, lambda _: insert_at(idx)) # type: ignore
+
+            if swap_at is not None and (0 < idx < len(lst)):
+                text(u, '^v') \
+                    .clickable(highlight, lambda _: swap_at(idx - 1, idx)) # type: ignore
+
+        return buttons_row
+
+
+    def enable_if_hover(p: Placeable) -> Placeable:
+        def place_fn(ctx: PlaceContext):
+            hover = False
+            def consume_event(e: HoveringEvent) -> bool:
+                nonlocal hover
+                in_rect = e.finger.in_rect(ctx, True)
+                hover = in_rect
+                return in_rect
+
+            ctx.context.event_manager.consume_events(HoveringEvent, consume_event)
+
+            if hover:
+                p.place_fn(ctx)
+
+        return Placeable(p.min_width, p.min_height, place_fn)
 
 
     def in_list_element_ui(u: ILoveUI, idx: int, e: T) -> Modifying:
@@ -2006,6 +2046,8 @@ def manageable_list(
         @row_content(u)
         def with_remove_button_row(u: ILoveUI):
             text(u, '-') \
+                .min_size_xy(12, 0) \
+                .modifier(enable_if_hover) \
                 .clickable(highlight, lambda _: remove_at(idx)) # type: ignore
 
             element_ui(u, idx, e)
@@ -2017,12 +2059,16 @@ def manageable_list(
     def elements_col(u: ILoveUI):
         for i, e in enumerate(lst):
             if insert_at is not None:
-                insert_button(u, i)
+                insert_and_swap_button(u, i) \
+                    .modifier(enable_if_hover)
 
             in_list_element_ui(u, i, e)
 
         if insert_at is not None:
-            insert_button(u, len(lst))
+            ui = insert_and_swap_button(u, len(lst))
+
+            if lst:
+                ui.modifier(enable_if_hover)
 
     return elements_col
 
@@ -2303,7 +2349,55 @@ def rgba_color_selector(u: ILoveUI, color_ref: Ref[Color]) -> Modifying:
         .min_size_xy(40, 0) \
         .ratio_expend(5, 1)
 
+
+
+# ==================== preview ====================
+
+
+
+preview_widgets: list[Callable[[ILoveUI], None]] | None = None
+
+
+
+def preview(*args, **kwargs) -> Callable[[Callable], Callable]:
+    '''
+    需要最终调用 fast_preview 才能看见效果
+    '''
+    def decorator(f: Callable) -> Callable:
+        global preview_widgets
+
+        def widget(u: ILoveUI):
+            f(u, *args, **kwargs)
+
+        if preview_widgets is None:
+            preview_widgets = []
+
+        preview_widgets.append(widget)
+        return f
+
+    return decorator
+
+
+
+def preview_layer(u: ILoveUI, id: UIPath):
+    @column_content(u)
+    def top(u: ILoveUI):
+        for widget in preview_widgets or ():
+            widget(u)
+
+    top.v_scroll(id)
+
+
+
+def fast_preview():
+    id = UIPath.root()
+    fast_debug(lambda u, _: preview_layer(u, id))
+
+
+
 # ==================== renderer ====================
+
+
 
 class PygameILoveUIRenderer(Renderer):
     def __init__(
@@ -2419,7 +2513,10 @@ class PygameILoveUIRenderer(Renderer):
             self.screen_surface.set_clip(None)
 
 
+
 # ==================== fast debug ====================
+
+
 
 class RenderLayerMode(Enum):
     all = auto()
@@ -2683,12 +2780,9 @@ def fast_debug(target_ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
                     .min_size_xy(300, 300)
 
     def fast_debug_ui(u: ILoveUI, ctx: FastStartContext) -> None:
-        # todo 随意调节窗口大小 [v]
-        # todo 暂停, 逐帧推进 [v]
         # todo 拦截所有事件并提供虚拟手指, 可以精确操控 [ ]
-        # todo 逐层渲染 [v]
         # todo 渲染剪刀区域 [ ]
-        # todo 可视化低代码编辑器
+        # todo 可视化低代码编辑器 [ ]
 
         nonlocal ui_renderer_ui_state
         if ui_renderer_ui_state is None:
@@ -2826,6 +2920,9 @@ class FastStart:
             elif e.type == pygame.KEYUP:
                 ctx.event_manager.send_event(KeyEvent, KeyEvent(e.key, e.scancode, e.unicode, False))
 
+        for finger in ctx.fingers:
+            ctx.event_manager.send_event(HoveringEvent, HoveringEvent(finger))
+
         # 清屏
         self.renderer.screen_surface.fill((40,40,40))
 
@@ -2850,32 +2947,43 @@ def fast_start(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
 # ==================== visual editor ====================
 
 @dataclass(slots=True)
+class PythonCode:
+    code_lines: list[str]
+    ui_state: UIPath = field(default_factory=UIPath.root)
+
+@dataclass(slots=True)
 class WidgetNode:
     widget_value: str
-    args: list['ContentNode'] = field(default_factory=lambda: [])
+    args: list['ContentNode | PythonCode'] = field(default_factory=lambda: [])
     modifiers: list['ModifierNode'] = field(default_factory=lambda: [])
+    ui_state: UIPath = field(default_factory=UIPath.root)
 
 @dataclass(slots=True)
 class ModifierNode:
     modifier_value: str
+    args: list[PythonCode] = field(default_factory=lambda: [])
+    ui_state: UIPath = field(default_factory=UIPath.root)
 
 @dataclass(slots=True)
 class ContentNode:
-    widgets: list['WidgetNode'] = field(default_factory=lambda: [])
+    widgets: list['WidgetNode | PythonCode'] = field(default_factory=lambda: [])
 
 
 class VisualTreeDumper:
     def __init__(self, tag_str: str = '\t') -> None:
         self.tag_str = tag_str
 
-    def dumpContentStr(self, n: ContentNode) -> str:
-        return '\n'.join(self.dumpContentLines(n))
+    def dump_content_str(self, n: ContentNode) -> str:
+        return '\n'.join(self.dump_content_lines(n))
 
-    def dumpWidgetLines(self, n: WidgetNode) -> Generator[str, None, None]:
+    def dump_python_code_lines(self, n: PythonCode) -> Generator[str, None, None]:
+        yield from n.code_lines
+
+    def dump_widget_lines(self, n: WidgetNode) -> Generator[str, None, None]:
         for i, arg in enumerate(n.args):
             yield f'def content{i}(u: ILoveUI) -> None:'
 
-            for line in self.dumpContentLines(arg):
+            for line in self.dump_content_lines(arg) if isinstance(arg, ContentNode) else self.dump_python_code_lines(arg):
                 yield f'{self.tag_str}{line}'
 
             yield ''
@@ -2885,9 +2993,9 @@ class VisualTreeDumper:
         for modifier in n.modifiers:
             yield f'{self.tag_str}.{modifier.modifier_value} \\'
 
-    def dumpContentLines(self, n: ContentNode) -> Generator[str, None, None]:
+    def dump_content_lines(self, n: ContentNode) -> Generator[str, None, None]:
         for widget in n.widgets:
-            for line in self.dumpWidgetLines(widget):
+            for line in self.dump_widget_lines(widget) if isinstance(widget, WidgetNode) else self.dump_python_code_lines(widget):
                 yield self.tag_str + line
 
             yield ''
@@ -2937,10 +3045,15 @@ class VisualTreeUI:
     single_window_key: UIPath = field(default_factory=UIPath.root)
     style: VisualTreeUIStyle = field(default_factory=lambda: random.choice(styles))
 
+
+    def python_code_ui(self, u: ILoveUI, n: PythonCode) -> Modifying:
+        return text_field(u, n.ui_state, Ref.from_attr(n, 'code_lines'))
+
+
     def visual_tree_content_ui(self, u: ILoveUI, n: ContentNode) -> Modifying:
         @row_content(u)
         def top_row(u: ILoveUI):
-            spacing(u) \
+            spacing(u, width=20) \
                 .background(self.style.content_bg)
 
             def insert_at(idx: int):
@@ -2954,7 +3067,7 @@ class VisualTreeUI:
             manageable_list(
                 u,
                 n.widgets,
-                element_ui=lambda u, _, e: self.visual_tree_widget_ui(u, e),
+                element_ui=lambda u, _, e: self.visual_tree_widget_ui(u, e) if isinstance(e, WidgetNode) else self.python_code_ui(u, e),
                 insert_at=insert_at,
                 remove_at=remove_at,
             )
@@ -2963,9 +3076,7 @@ class VisualTreeUI:
 
 
     def visual_tree_modifier_ui(self, u: ILoveUI, n: ModifierNode) -> Modifying:
-
-        return text(u, n.modifier_value, color=self.style.modifier_text) \
-            .background(self.style.modifier_bg)
+        return text_field(u, n.ui_state, Ref.from_attr(n, 'modifier_value').value_changed(lambda _, _1: self.on_tree_changed()))
 
 
     def visual_tree_widget_ui(self, u: ILoveUI, n: WidgetNode) -> Modifying:
@@ -2980,7 +3091,7 @@ class VisualTreeUI:
                 text(u, 'args: ', color=self.style.widget_text) \
                     .background(self.style.widget_bg)
 
-                def insert_at(idx: int):
+                def insert_arg_at(idx: int):
                     n.args.insert(idx, ContentNode())
                     self.on_tree_changed()
 
@@ -2988,12 +3099,19 @@ class VisualTreeUI:
                     del n.args[idx]
                     self.on_tree_changed()
 
+                def swap_at(idx: int, idx1: int):
+                    t = n.args[idx]
+                    n.args[idx] = n.args[idx1]
+                    n.args[idx1] = t
+                    self.on_tree_changed()
+
                 manageable_list(
                     u,
                     n.args,
-                    element_ui=lambda u, _, e: self.visual_tree_content_ui(u, e),
-                    insert_at=insert_at,
+                    element_ui=lambda u, _, e: self.visual_tree_content_ui(u, e) if isinstance(e, ContentNode) else self.python_code_ui(u, e),
+                    insert_at=insert_arg_at,
                     remove_at=remove_at,
+                    swap_at=swap_at,
                 )
 
             @row_content(u)
@@ -3009,12 +3127,19 @@ class VisualTreeUI:
                     del n.modifiers[idx]
                     self.on_tree_changed()
 
+                def swap_at(idx: int, idx1: int):
+                    t = n.modifiers[idx]
+                    n.modifiers[idx] = n.modifiers[idx1]
+                    n.modifiers[idx1] = t
+                    self.on_tree_changed()
+
                 manageable_list(
                     u,
                     n.modifiers,
                     element_ui=lambda u, _, e: self.visual_tree_modifier_ui(u, e),
                     insert_at=insert_at,
                     remove_at=remove_at,
+                    swap_at=swap_at,
                 )
 
         return top \
@@ -3029,7 +3154,7 @@ class VisualEditor:
         self.code_text = ''
 
     def on_tree_changed(self):
-        self.code_text = VisualTreeDumper('    ').dumpContentStr(self.tree.root_content)
+        self.code_text = VisualTreeDumper('    ').dump_content_str(self.tree.root_content)
 
     def code_ui(self, u: ILoveUI) -> Modifying:
         return text_field(u, self.id / 'code_ui text', Ref.from_attr(self, 'code_text')) \
@@ -3040,11 +3165,14 @@ class VisualEditor:
         def top_row(u: ILoveUI):
 
             self.tree.visual_tree_content_ui(u, self.tree.root_content) \
-                .v_scroll(self.id / 'v_scroll') \
-                .h_scroll(self.id / 'h_scroll') \
+                .v_scroll(self.id / 'tree v_scroll') \
+                .h_scroll(self.id / 'tree h_scroll') \
                 .flex()
 
-            self.code_ui(u)
+            self.code_ui(u) \
+                .v_scroll(self.id / 'code v_scroll') \
+                .h_scroll(self.id / 'code h_scroll') \
+                .flex()
 
         return top_row
 
@@ -3132,7 +3260,7 @@ def open_window_button(u: ILoveUI, id: UIPath) -> Modifying:
                         toast(u, 'window closed')
                         ctx.close()
 
-            @box_content(u)
+            @memo_content(u, window_id / 'memo layout')
             def window_box(u: ILoveUI):
                 window_close_button(u, close_window)
 
@@ -3170,6 +3298,8 @@ def open_window_button(u: ILoveUI, id: UIPath) -> Modifying:
     return buttons_row \
         .getRect(rect_ref)
 
+
+
 def fruits_ui(u: ILoveUI, id: UIPath, fruits_lst: list[str], selected_index: Ref[int]) -> Modifying:
     @memo_content(u, id / 'memo test', fruits_lst[selected_index.value])
     def memo_test(u: ILoveUI):
@@ -3197,6 +3327,8 @@ def fruits_ui(u: ILoveUI, id: UIPath, fruits_lst: list[str], selected_index: Ref
     return fruits_row \
         .expend_xy(0, 20)
 
+
+
 def test_scroll_ui(u: ILoveUI, id: UIPath) -> Modifying:
     def element_button(u: ILoveUI, i: int, id: UIPath) -> Modifying:
         return text(u, f'element {i}', id) \
@@ -3212,6 +3344,8 @@ def test_scroll_ui(u: ILoveUI, id: UIPath) -> Modifying:
 
     return element_buttons \
         .expend_xy(40, 80)
+
+
 
 @dataclass(slots=True)
 class TestUIState:
@@ -3327,13 +3461,34 @@ def test_screen_content(u: ILoveUI, fps: float):
         .animated_rect(test_ui_state.ui_root / 'top_column animate')
 
 def main():
-    fast_debug(lambda u, ctx: test_screen_content(u, ctx.fps)) # 测试界面 v1
+    v = VisualEditor()
+    ui: Callable[[ILoveUI, FastStartContext], None]
 
-    # v = VisualEditor()
-    # def ui(u: ILoveUI, _):
-        # popup_layer(u)
-        # v.visual_editor_ui(u)
-    # fast_debug(ui)
+    def set_ui(value: Callable[[ILoveUI, FastStartContext], None]):
+        nonlocal ui
+        ui = value
+
+    def test_screen_ui(u: ILoveUI, ctx: FastStartContext):
+        test_screen_content(u, ctx.fps)
+
+    def visual_editor(u: ILoveUI, _: FastStartContext):
+        popup_layer(u)
+        v.visual_editor_ui(u)
+
+    def choice_ui(u: ILoveUI, ctx: FastStartContext):
+        @column_content(u)
+        def choice_col(u: ILoveUI):
+            text(u, 'visual_editor').clickable(highlight, lambda _: set_ui(visual_editor))
+            text(u, 'test screen').clickable(highlight, lambda _: set_ui(test_screen_ui))
+
+    ui = choice_ui
+
+    def dispatcher(u: ILoveUI, ctx: FastStartContext):
+        if ui is not choice_ui:
+            window_close_button(u, lambda: set_ui(choice_ui))
+        ui(u, ctx)
+
+    fast_debug(dispatcher)
 
 if __name__ == '__main__':
     main()
