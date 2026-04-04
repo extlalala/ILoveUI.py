@@ -175,7 +175,7 @@ class Finger:
     def on_release(self, listener: Callable[['Finger'], None]) -> None:
         self.release_listeners.append(listener)
 
-    def in_rect(self, ctx: 'PlaceContext', check_scissor_rect: bool) -> bool:
+    def in_rect(self, ctx: 'PlaceContext', check_scissor_rect: bool = True) -> bool:
         return ((not check_scissor_rect or ctx.context.renderer.contains_point(self.x, self.y)) and
                 ctx.rect.contains_point(self.x, self.y))
 
@@ -271,6 +271,7 @@ highlight = Color(255, 255, 255, 127)
 green = Color(20, 255, 20)
 gray = Color(20, 20, 20)
 white = Color(255, 255, 255)
+black = Color(0, 0, 0)
 
 
 
@@ -496,6 +497,7 @@ class Modifying:
 
             if not touch_through:
                 ctx.context.event_manager.consume_events(NewFingerEvent, lambda e: e.finger.in_rect(ctx, True))
+                ctx.context.event_manager.consume_events(HoveringEvent, lambda e: e.finger.in_rect(ctx, True))
 
             ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, color))
 
@@ -523,7 +525,7 @@ class Modifying:
 
                 if in_rect:
                     def finger_release_listener(finger):
-                        if e.finger.in_rect(ctx, check_scissor_rect):
+                        if finger.in_rect(ctx, check_scissor_rect):
                             click_callback(finger)
 
                     e.finger.on_release(finger_release_listener)
@@ -532,8 +534,14 @@ class Modifying:
 
             ctx.context.event_manager.consume_events(NewFingerEvent, consume_new_finger_event)
 
-            if hover_color is not None and any(finger.in_rect(ctx, check_scissor_rect) for finger in ctx.context.fingers):
-                ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, hover_color)) # type: ignore
+            if hover_color is not None:
+                def consume_hovering_event(e: HoveringEvent) -> bool:
+                    in_rect = e.finger.in_rect(ctx, True)
+                    if in_rect:
+                        ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, hover_color)) # type: ignore
+                    return in_rect
+
+                ctx.context.event_manager.consume_events(HoveringEvent, consume_hovering_event)
 
             p.place_fn(ctx)
 
@@ -587,11 +595,11 @@ class Modifying:
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
-    def tag_up(self, u: 'ILoveUI', tag_str: str, id: UIPath | None = None) -> Self:
+    def tag_up(self, u: 'ILoveUI', tag_str: str, id: UIPath | None = None, text_color: Color = white) -> Self:
         p = self.placeable
 
         def box_content(u: ILoveUI):
-            text(u, tag_str, id / 'tag_ui' if id is not None else None)
+            text(u, tag_str, id / 'tag_ui' if id is not None else None, color=text_color)
             u.element_placeable(p)
 
         self.placeable = u.context.to_placeable(box_content, box)
@@ -1276,8 +1284,15 @@ def window(
 
             frame_rect = ctx.rect
             content_rect = frame_rect.with_padding(WINDOW_FRAME_SIZE, WINDOW_FRAME_SIZE)
-            if any(frame_rect.contains_point(finger.x, finger.y) and not content_rect.contains_point(finger.x, finger.y) for finger in ctx.context.fingers):
-                ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, highlight))
+
+            def consume_hovering_event(e: HoveringEvent) -> bool:
+                finger = e.finger
+                in_frame = frame_rect.contains_point(finger.x, finger.y) and not content_rect.contains_point(finger.x, finger.y)
+                if in_frame:
+                    ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, highlight))
+                return in_frame
+
+            ctx.context.event_manager.consume_events(HoveringEvent, consume_hovering_event)
 
         return Placeable(p.min_width, p.min_height, place_fn)
 
@@ -1976,6 +1991,7 @@ def checkbox(u: ILoveUI, id: UIPath, checked: Ref[bool]) -> Modifying:
                 .animated_rect(id / 'animated_rect 2')
 
     return top_box \
+        .ratio_expend(2, 1) \
         .clickable(None, toggle_checked)
 
 
@@ -2635,6 +2651,7 @@ class UIRendererUIState:
     single_step_mode: bool = False
     step: bool = False
     cached_render_tick_listeners: list[RenderOperate] | None = None
+    sync_events: bool = True
 
     def toggle_mode(self) -> None:
         self.single_step_mode = not self.single_step_mode
@@ -2647,6 +2664,7 @@ def ui_renderer_ui(
     state: UIRendererUIState,
     map_render_tick_listeners: Callable[[list[RenderOperate]], list[RenderOperate]] | None = None,
     rect: Rect | None = None,
+    before_step: Callable[[], None] | None = None
 ) -> Modifying:
     '''
     用于 ui 调试器
@@ -2656,9 +2674,19 @@ def ui_renderer_ui(
         '''
         收集绘制指令到 list
         '''
+        if before_step is not None:
+            before_step()
+
         p = state.target_ui_u.context.to_placeable(lambda u: state.target_ui(u, state.fast_start_ctx))
         render_tick_listeners: list[RenderOperate] = []
-        p.place_fn(PlaceContext(rect if rect is not None else ctx.rect, ctx.context, render_tick_listeners))
+
+        context = state.target_ui_u.context
+        if state.sync_events:
+            for type, events in ctx.context.event_manager.event_by_type.items():
+                for event in events:
+                    context.event_manager.send_event_instantly(type, event)
+
+        p.place_fn(PlaceContext(rect if rect is not None else ctx.rect, context, render_tick_listeners))
         return render_tick_listeners
 
     def place_fn(ctx: PlaceContext):
@@ -2734,84 +2762,211 @@ def render_code_ui(u: ILoveUI, id: UIPath, target_ui_ref: Ref[Callable[[ILoveUI,
 
     return top
 
+
+
+class VFingerState(Enum):
+    up = auto()
+    to_down = auto()
+    down = auto()
+    to_up = auto()
+
+
+
+@dataclass(slots=True)
+class VFinger:
+    finger: Finger = field(default_factory=lambda: Finger(0, 0))
+    x: float = 0
+    y: float = 0
+    state: VFingerState = VFingerState.up
+    id: UIPath = field(default_factory=UIPath.root)
+
+
+    def send_event(self, u: ILoveUI):
+        u.context.event_manager.send_event_instantly(HoveringEvent, HoveringEvent(self.finger))
+
+        match self.state:
+            case VFingerState.up: ...
+            case VFingerState.to_down:
+                u.context.event_manager.send_event_instantly(NewFingerEvent, NewFingerEvent(self.finger))
+                self.state = VFingerState.down
+
+            case VFingerState.down:
+                if self.x != self.finger.x or self.y != self.finger.y:
+                    self.finger.x = self.x
+                    self.finger.y = self.y
+                    for listener in self.finger.drag_listeners:
+                        listener(self.finger)
+
+            case VFingerState.to_up:
+                for listener in self.finger.release_listeners:
+                    listener(self.finger)
+                self.finger.drag_listeners.clear()
+                self.finger.release_listeners.clear()
+                self.state = VFingerState.up
+
+        self.finger.x = self.x
+        self.finger.y = self.y
+
+
+    def set_state(self, value: VFingerState):
+        self.state = value
+
+
+    def v_finger(self, u: ILoveUI):
+        def draggable_modifier(p: Placeable) -> Placeable:
+            def place_fn(ctx: PlaceContext):
+                new_rect = Rect(self.x, self.y - p.min_height / 2, p.min_width, p.min_height)
+                ctx = PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners)
+                p.place_fn(ctx)
+
+                def consume_new_finger_event(e: NewFingerEvent) -> bool:
+                    in_rect = e.finger.in_rect(ctx)
+
+                    if in_rect:
+                        def handle_finger(finger: Finger):
+                            self.x = finger.x
+                            self.y = finger.y
+
+                        e.finger.on_drag(handle_finger)
+
+                    return in_rect
+
+                ctx.context.event_manager.consume_events(NewFingerEvent, consume_new_finger_event)
+
+                hover = False
+
+                def consume_hovering_event(e: HoveringEvent) -> bool:
+                    nonlocal hover
+                    in_rect = e.finger.in_rect(ctx)
+                    if in_rect:
+                        hover = True
+                    return in_rect
+
+                ctx.context.event_manager.consume_events(HoveringEvent, consume_hovering_event)
+
+                if hover:
+                    ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, highlight))
+
+            return Placeable(p.min_width, p.min_height, place_fn)
+
+        @row_content(u)
+        def top(u: ILoveUI):
+            text(u, '<- v finger', color=black)
+
+            match self.state:
+                case VFingerState.up:
+                    text(u, 'curr up', color=black) \
+                        .clickable(highlight, lambda _: self.set_state(VFingerState.to_down))
+                case VFingerState.to_down:
+                    text(u, 'curr to down', color=black) \
+                        .clickable(highlight, lambda _: self.set_state(VFingerState.up))
+                case VFingerState.down:
+                    text(u, 'curr down', color=black) \
+                        .clickable(highlight, lambda _: self.set_state(VFingerState.to_up))
+                case VFingerState.to_up:
+                    text(u, 'curr to up', color=black) \
+                        .clickable(highlight, lambda _: self.set_state(VFingerState.down))
+
+        top \
+            .background(highlight, touch_through=True) \
+            .modifier(draggable_modifier)
+
+
+
 @dataclass(slots=True)
 class FastStartContext:
     fps: float
 
-def fast_debug(target_ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
-    render_layer_manager = RenderLayerManager()
-    ui_renderer_ui_state: UIRendererUIState | None = None
-    color_ref = Ref.new_box(Color(0, 0, 0, 255))
+checkbox_text_color = Color(220, 20, 220)
 
+@dataclass(slots=True)
+class FastDebug:
+    ui_renderer_ui_state: UIRendererUIState
+    intercept_events: bool = False
+    v_finger: VFinger = field(default_factory=VFinger)
+    show_v_finger: bool = True
     ui_rect: Rect | None = None
     show_rect: bool = True
-    id = UIPath.root()
 
-    def open_ui_rect_control_window(u: ILoveUI):
-        @window_content(u, single_window_key=id / 'ui_rect_control_window')
-        def ui_rect_control_window(u: ILoveUI, ctx: PopupContext):
-            def set_rect(value: Rect | None) -> None:
-                nonlocal ui_rect
-                ui_rect = value
-            def set_show_rect(value: bool) -> None:
-                nonlocal show_rect
-                show_rect = value
-            debug_ui_rect_control_ui(u, Ref(lambda: ui_rect, set_rect), Ref(lambda: show_rect, set_show_rect))
+    render_layer_manager: RenderLayerManager = field(default_factory=RenderLayerManager)
+    color_ref: Ref[Color] = field(default_factory=lambda: Ref.new_box(Color(0, 0, 0, 255)))
+    id: UIPath = field(default_factory=UIPath.root)
 
-    def open_color_selector_window(u: ILoveUI):
-        @window_content(u, single_window_key=id / 'color_selector_window')
-        def color_selector_window(u: ILoveUI, ctx: PopupContext):
-            rgba_color_selector(u, color_ref)
 
-    def open_render_layer_window(u: ILoveUI):
-        @window_content(u, single_window_key=id / 'render_layer_window')
-        def render_layer_window(u: ILoveUI, ctx: PopupContext):
-            if ui_renderer_ui_state is not None:
-                max_layer = len(ui_renderer_ui_state.cached_render_tick_listeners) if ui_renderer_ui_state.cached_render_tick_listeners is not None else 0
-            else:
-                max_layer = 0
-            render_layer_control_ui(u, max_layer, render_layer_manager)
+    def fast_debug_ui(self, u: ILoveUI) -> None:
+        id = self.id
+        color_ref = self.color_ref
 
-    def open_code_window(u: ILoveUI):
-        @window_content(u, single_window_key=id / 'code_window')
-        def render_layer_window(u: ILoveUI, ctx: PopupContext):
-            if ui_renderer_ui_state is not None:
-                render_code_ui(u, id / 'render_code_ui', Ref.from_attr(ui_renderer_ui_state, UIRendererUIState.target_ui.__name__)) \
-                    .min_size_xy(300, 300)
+        def open_ui_rect_control_window(u: ILoveUI):
+            @window_content(u, single_window_key=id / 'ui_rect_control_window')
+            def ui_rect_control_window(u: ILoveUI, ctx: PopupContext):
+                debug_ui_rect_control_ui(u, Ref.from_attr(self, 'ui_rect'), Ref.from_attr(self, 'show_rect'))
 
-    def fast_debug_ui(u: ILoveUI, ctx: FastStartContext) -> None:
-        # todo 拦截所有事件并提供虚拟手指, 可以精确操控 [ ]
-        # todo 渲染剪刀区域 [ ]
-        # todo 可视化低代码编辑器 [ ]
+        def open_color_selector_window(u: ILoveUI):
+            @window_content(u, single_window_key=id / 'color_selector_window')
+            def color_selector_window(u: ILoveUI, ctx: PopupContext):
+                rgba_color_selector(u, color_ref)
 
-        nonlocal ui_renderer_ui_state
-        if ui_renderer_ui_state is None:
-            target_ui_u = ILoveUI(ILoveUIContext(u.context.renderer))
-            ui_renderer_ui_state = UIRendererUIState(ctx, target_ui, target_ui, target_ui_u)
-        else:
-            ui_renderer_ui_state.fast_start_ctx = ctx
+        def open_render_layer_window(u: ILoveUI):
+            @window_content(u, single_window_key=id / 'render_layer_window')
+            def render_layer_window(u: ILoveUI, ctx: PopupContext):
+                if self.ui_renderer_ui_state is not None:
+                    max_layer = len(self.ui_renderer_ui_state.cached_render_tick_listeners) if self.ui_renderer_ui_state.cached_render_tick_listeners is not None else 0
+                else:
+                    max_layer = 0
+                render_layer_control_ui(u, max_layer, self.render_layer_manager)
+
+        def open_code_window(u: ILoveUI):
+            @window_content(u, single_window_key=id / 'code_window')
+            def render_layer_window(u: ILoveUI, ctx: PopupContext):
+                if self.ui_renderer_ui_state is not None:
+                    render_code_ui(u, id / 'render_code_ui', Ref.from_attr(self.ui_renderer_ui_state, UIRendererUIState.target_ui.__name__)) \
+                        .min_size_xy(300, 300)
+
+        def open_v_finger_window(u: ILoveUI):
+            @window_content(u, single_window_key=id / 'v_finger_window', layout=column)
+            def render_layer_window(u: ILoveUI, ctx: PopupContext):
+                checkbox(u, id / 'intercept events checkbox', Ref.from_attr(self, 'intercept_events')) \
+                    .flex() \
+                    .tag_up(u, 'intercept events', id / 'intercept events checkbox tag', text_color=checkbox_text_color)
+
+                checkbox(u, id / 'show v finger checkbox', Ref.from_attr(self, 'show_v_finger')) \
+                    .flex() \
+                    .tag_up(u, 'show v-finger', id / 'show v finger checkbox tag', text_color=checkbox_text_color)
 
         popup_layer(u)
 
-        if show_rect and ui_rect is not None:
+        if self.show_v_finger:
+            self.v_finger.v_finger(u)
+
+        if self.show_rect and self.ui_rect is not None:
             spacing(u) \
                 .background(highlight, touch_through=True) \
-                .with_rect(ui_rect)
+                .with_rect(self.ui_rect)
 
         @column_content(u)
         def top_column(u: ILoveUI):
 
-            if ui_renderer_ui_state is not None:
-                ui_renderer_ui(u, ui_renderer_ui_state, map_render_tick_listeners=render_layer_manager.render_mode_to_list_mapper(), rect=ui_rect) \
-                    .flex() \
-                    .scissor()
+            if self.ui_renderer_ui_state is not None:
+                self.ui_renderer_ui_state.sync_events = not self.intercept_events
+                ui_renderer_ui(
+                    u,
+                    self.ui_renderer_ui_state,
+                    map_render_tick_listeners=self.render_layer_manager.render_mode_to_list_mapper(),
+                    rect=self.ui_rect,
+                    before_step=lambda: self.v_finger.send_event(self.ui_renderer_ui_state.target_ui_u) # type: ignore
+                ) \
+                    .flex()
 
             @row_content(u)
             def control_row(u: ILoveUI):
-
                 checkbox(u, id / 'scissor checkbox', Ref(u.context.renderer.get_scissor_enabled, u.context.renderer.set_scissor_enabled)) \
                     .flex() \
-                    .tag_up(u, 'scissor', id / 'scissor checkbox tag')
+                    .tag_up(u, 'scissor', id / 'scissor checkbox tag', text_color=checkbox_text_color)
+
+                text(u, 'v-finger') \
+                    .flex() \
+                    .clickable(highlight, lambda _: open_v_finger_window(u), check_scissor_rect=False)
 
                 text(u, 'ui rect') \
                     .flex() \
@@ -2829,118 +2984,141 @@ def fast_debug(target_ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
                     .flex() \
                     .clickable(highlight, lambda _: open_code_window(u), check_scissor_rect=False)
 
-                if ui_renderer_ui_state is not None:
-                    text(u, 'single step' if ui_renderer_ui_state.single_step_mode else 'run') \
+                if self.ui_renderer_ui_state is not None:
+                    text(u, 'single step' if self.ui_renderer_ui_state.single_step_mode else 'running') \
                         .flex() \
-                        .clickable(highlight, lambda _: ui_renderer_ui_state.toggle_mode() if ui_renderer_ui_state is not None else None, check_scissor_rect=False)
+                        .clickable(highlight, lambda _: self.ui_renderer_ui_state.toggle_mode() if self.ui_renderer_ui_state is not None else None, check_scissor_rect=False)
 
-                    text(u, 'stepping' if ui_renderer_ui_state.step else 'step') \
+                    text(u, 'stepping' if self.ui_renderer_ui_state.step else 'step') \
                         .flex() \
-                        .clickable(highlight, lambda _: ui_renderer_ui_state.toggle_step() if ui_renderer_ui_state is not None else None, check_scissor_rect=False)
+                        .clickable(highlight, lambda _: self.ui_renderer_ui_state.toggle_step() if self.ui_renderer_ui_state is not None else None, check_scissor_rect=False)
 
         spacing(u) \
             .background(color_ref.value)
+
+
+def fast_debug(target_ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
+    state: FastDebug | None = None
+
+    def fast_debug_ui(u: ILoveUI, ctx: FastStartContext) -> None:
+        nonlocal state
+        # todo 渲染剪刀区域 [ ]
+        # todo 可视化低代码编辑器 [ ]
+
+        if state is None:
+            target_ui_u = ILoveUI(ILoveUIContext(u.context.renderer))
+            state = FastDebug(UIRendererUIState(ctx, target_ui, target_ui, target_ui_u))
+
+        state.ui_renderer_ui_state.fast_start_ctx = ctx
+        state.fast_debug_ui(u)
 
     fast_start(fast_debug_ui)
 
 # ==================== fast start ====================
 
 class FastStart:
-    def __init__(self, ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
+    def __init__(self, ui: Callable[[ILoveUI, FastStartContext], None], ctx: ILoveUIContext, screen_rect: Rect) -> None:
         self.ui = ui
-
-        # pygame初始化
-        pygame.init()
-        self.screen = pygame.display.set_mode((800, 800), pygame.SRCALPHA | pygame.RESIZABLE)
-        self.screen_rect = Rect(0, 0, 800, 800)
-        pygame.display.set_caption("ILoveUI")
-        self.clock = pygame.time.Clock()
-        self.running = True
-
-        self.renderer = PygameILoveUIRenderer(self.screen)
-        ctx = ILoveUIContext(self.renderer)
-        ctx.fingers.append(Finger(0, 0))
         self.ctx = ctx
+        self.screen_rect = screen_rect
+        self.fps = 0.0
 
-        pygame.key.set_repeat(320, 50) # todo 这是为了流畅的文本删除, 但是会导致其它键的 KeyDown 事件快速连续触发
 
-    def tick(self) -> None:
-        if not self.running:
-            return
+
+    def handle_pygame_event(self, e: pygame.event.Event):
         ctx = self.ctx
 
-        # 事件处理
-        for e in pygame.event.get():
-            if e.type == pygame.QUIT:
-                self.running = False
+        if e.type == pygame.VIDEORESIZE:
+            self.screen_rect = Rect(0, 0, e.size[0], e.size[1])
 
-            elif e.type == pygame.VIDEORESIZE:
-                self.screen_rect = Rect(0, 0, e.size[0], e.size[1])
+        elif e.type == pygame.TEXTINPUT:
+            self.ctx.event_manager.send_event(TextInputEvent, TextInputEvent(e.text))
 
-            elif e.type == pygame.TEXTINPUT:
-                self.ctx.event_manager.send_event(TextInputEvent, TextInputEvent(e.text))
+        elif e.type == pygame.MOUSEWHEEL:
+            mouse_x, mouse_y = pygame.mouse.get_pos()
+            ctx.event_manager.send_event(ScrollEvent, ScrollEvent(mouse_x, mouse_y, e.x, e.y))
 
-            elif e.type == pygame.MOUSEWHEEL:
-                mouse_x, mouse_y = pygame.mouse.get_pos()
-                ctx.event_manager.send_event(ScrollEvent, ScrollEvent(mouse_x, mouse_y, e.x, e.y))
-
-            elif e.type == pygame.MOUSEBUTTONDOWN:
-                if e.button != 4 and e.button != 5: # 排除滚轮事件
-                    x, y = e.pos
-                    finger = Finger(x, y)
-                    if len(ctx.fingers) > 0:
-                        ctx.fingers[0] = finger
-                    else:
-                        ctx.fingers.append(finger)
-                    ctx.event_manager.send_event(NewFingerEvent, NewFingerEvent(finger))
-
-            elif e.type == pygame.MOUSEMOTION:
+        elif e.type == pygame.MOUSEBUTTONDOWN:
+            if e.button != 4 and e.button != 5: # 排除滚轮事件
+                x, y = e.pos
+                finger = Finger(x, y)
                 if len(ctx.fingers) > 0:
-                    finger = ctx.fingers[0]
-                    x, y = e.pos
-                    finger.x = x
-                    finger.y = y
-                    for listener in finger.drag_listeners:
-                        listener(finger)
+                    ctx.fingers[0] = finger
+                else:
+                    ctx.fingers.append(finger)
+                ctx.event_manager.send_event(NewFingerEvent, NewFingerEvent(finger))
 
-            elif e.type == pygame.MOUSEBUTTONUP:
-                if len(ctx.fingers) > 0:
-                    finger = ctx.fingers[0]
-                    x, y = e.pos
-                    finger.x = x
-                    finger.y = y
-                    finger.drag_listeners.clear()
-                    for listener in finger.release_listeners:
-                        listener(finger)
-                    finger.release_listeners.clear()
+        elif e.type == pygame.MOUSEMOTION:
+            if len(ctx.fingers) > 0:
+                finger = ctx.fingers[0]
+                x, y = e.pos
+                finger.x = x
+                finger.y = y
+                for listener in finger.drag_listeners:
+                    listener(finger)
 
-            elif e.type == pygame.KEYDOWN:
-                ctx.event_manager.send_event(KeyEvent, KeyEvent(e.key, e.scancode, e.unicode, True))
+        elif e.type == pygame.MOUSEBUTTONUP:
+            if len(ctx.fingers) > 0:
+                finger = ctx.fingers[0]
+                x, y = e.pos
+                finger.x = x
+                finger.y = y
+                finger.drag_listeners.clear()
+                for listener in finger.release_listeners:
+                    listener(finger)
+                finger.release_listeners.clear()
 
-            elif e.type == pygame.KEYUP:
-                ctx.event_manager.send_event(KeyEvent, KeyEvent(e.key, e.scancode, e.unicode, False))
+        elif e.type == pygame.KEYDOWN:
+            ctx.event_manager.send_event(KeyEvent, KeyEvent(e.key, e.scancode, e.unicode, True))
+
+        elif e.type == pygame.KEYUP:
+            ctx.event_manager.send_event(KeyEvent, KeyEvent(e.key, e.scancode, e.unicode, False))
+
+
+
+    def tick(self) -> None:
+        ctx = self.ctx
 
         for finger in ctx.fingers:
             ctx.event_manager.send_event(HoveringEvent, HoveringEvent(finger))
 
-        # 清屏
-        self.renderer.screen_surface.fill((40,40,40))
-
         ctx.event_manager.before_render()
-        ctx.render_in(self.screen_rect, lambda u: self.ui(u, FastStartContext(self.clock.get_fps())))
+        ctx.render_in(self.screen_rect, lambda u: self.ui(u, FastStartContext(self.fps)))
+
+
+
+def fast_start(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
+    running = True
+
+    # pygame初始化
+    pygame.init()
+    screen = pygame.display.set_mode((800, 800), pygame.SRCALPHA | pygame.RESIZABLE)
+    screen_rect = Rect(0, 0, 800, 800)
+    pygame.display.set_caption("ILoveUI")
+    clock = pygame.time.Clock()
+
+    renderer = PygameILoveUIRenderer(screen)
+    ctx = ILoveUIContext(renderer)
+    fast_start = FastStart(ui, ctx, screen_rect)
+
+    pygame.key.set_repeat(320, 50) # todo 这是为了流畅的文本删除, 但是会导致其它键的 KeyDown 事件快速连续触发
+
+    while running:
+        # 事件处理
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                running = False
+            fast_start.handle_pygame_event(e)
+
+        # 清屏
+        screen.fill((40,40,40))
+        fast_start.fps = clock.get_fps()
+
+        fast_start.tick()
 
         # 刷新屏幕
         pygame.display.flip()
-        self.clock.tick(60)
-
-    def quit(self) -> None:
-        self.running = False
-
-def fast_start(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
-    s = FastStart(ui)
-
-    while s.running:
-        s.tick()
+        clock.tick(60)
 
     pygame.quit()
 
@@ -2951,6 +3129,9 @@ class PythonCode:
     code_lines: list[str]
     ui_state: UIPath = field(default_factory=UIPath.root)
 
+    def visual_tree_ui(self, u: ILoveUI, _: 'VisualTreeUI') -> Modifying:
+        return text_field(u, self.ui_state, Ref.from_attr(self, 'code_lines'))
+
 @dataclass(slots=True)
 class WidgetNode:
     widget_value: str
@@ -2958,15 +3139,110 @@ class WidgetNode:
     modifiers: list['ModifierNode'] = field(default_factory=lambda: [])
     ui_state: UIPath = field(default_factory=UIPath.root)
 
+    def visual_tree_ui(self, u: ILoveUI, tree_ui: 'VisualTreeUI') -> Modifying:
+        @column_content(u)
+        def top(u: ILoveUI):
+
+            text(u, self.widget_value, color=tree_ui.style.widget_text) \
+                .background(tree_ui.style.widget_bg)
+
+            @row_content(u)
+            def args_row(u: ILoveUI):
+                text(u, 'args: ', color=tree_ui.style.widget_text) \
+                    .background(tree_ui.style.widget_bg)
+
+                def insert_arg_at(idx: int):
+                    self.args.insert(idx, ContentNode())
+                    tree_ui.on_tree_changed()
+
+                def remove_at(idx: int):
+                    del self.args[idx]
+                    tree_ui.on_tree_changed()
+
+                def swap_at(idx: int, idx1: int):
+                    t = self.args[idx]
+                    self.args[idx] = self.args[idx1]
+                    self.args[idx1] = t
+                    tree_ui.on_tree_changed()
+
+                manageable_list(
+                    u,
+                    self.args,
+                    element_ui=lambda u, _, e: e.visual_tree_ui(u, tree_ui),
+                    insert_at=insert_arg_at,
+                    remove_at=remove_at,
+                    swap_at=swap_at,
+                )
+
+            @row_content(u)
+            def modifiers_row(u: ILoveUI):
+                text(u, 'modifiers: ', color=tree_ui.style.widget_text) \
+                    .background(tree_ui.style.widget_bg)
+
+                def insert_at(idx: int):
+                    self.modifiers.insert(idx, ModifierNode('new modifier'))
+                    tree_ui.on_tree_changed()
+
+                def remove_at(idx: int):
+                    del self.modifiers[idx]
+                    tree_ui.on_tree_changed()
+
+                def swap_at(idx: int, idx1: int):
+                    t = self.modifiers[idx]
+                    self.modifiers[idx] = self.modifiers[idx1]
+                    self.modifiers[idx1] = t
+                    tree_ui.on_tree_changed()
+
+                manageable_list(
+                    u,
+                    self.modifiers,
+                    element_ui=lambda u, _, e: e.visual_tree_ui(u, tree_ui),
+                    insert_at=insert_at,
+                    remove_at=remove_at,
+                    swap_at=swap_at,
+                )
+
+        return top \
+            .background(gray)
+
+
 @dataclass(slots=True)
 class ModifierNode:
     modifier_value: str
     args: list[PythonCode] = field(default_factory=lambda: [])
     ui_state: UIPath = field(default_factory=UIPath.root)
 
+    def visual_tree_ui(self, u: ILoveUI, tree_ui: 'VisualTreeUI') -> Modifying:
+        return text_field(u, self.ui_state, Ref.from_attr(self, 'modifier_value').value_changed(lambda _, _1: tree_ui.on_tree_changed()))
+
+
 @dataclass(slots=True)
 class ContentNode:
     widgets: list['WidgetNode | PythonCode'] = field(default_factory=lambda: [])
+
+    def visual_tree_ui(n, u: ILoveUI, self: 'VisualTreeUI') -> Modifying:
+        @row_content(u)
+        def top_row(u: ILoveUI):
+            spacing(u, width=20) \
+                .background(self.style.content_bg)
+
+            def insert_at(idx: int):
+                n.widgets.insert(idx, WidgetNode('new widget'))
+                self.on_tree_changed()
+
+            def remove_at(idx: int):
+                del n.widgets[idx]
+                self.on_tree_changed()
+
+            manageable_list(
+                u,
+                n.widgets,
+                element_ui=lambda u, _, e: e.visual_tree_ui(u, self),
+                insert_at=insert_at,
+                remove_at=remove_at,
+            )
+
+        return top_row
 
 
 class VisualTreeDumper:
@@ -3045,105 +3321,8 @@ class VisualTreeUI:
     single_window_key: UIPath = field(default_factory=UIPath.root)
     style: VisualTreeUIStyle = field(default_factory=lambda: random.choice(styles))
 
-
-    def python_code_ui(self, u: ILoveUI, n: PythonCode) -> Modifying:
-        return text_field(u, n.ui_state, Ref.from_attr(n, 'code_lines'))
-
-
-    def visual_tree_content_ui(self, u: ILoveUI, n: ContentNode) -> Modifying:
-        @row_content(u)
-        def top_row(u: ILoveUI):
-            spacing(u, width=20) \
-                .background(self.style.content_bg)
-
-            def insert_at(idx: int):
-                n.widgets.insert(idx, WidgetNode('new widget'))
-                self.on_tree_changed()
-
-            def remove_at(idx: int):
-                del n.widgets[idx]
-                self.on_tree_changed()
-
-            manageable_list(
-                u,
-                n.widgets,
-                element_ui=lambda u, _, e: self.visual_tree_widget_ui(u, e) if isinstance(e, WidgetNode) else self.python_code_ui(u, e),
-                insert_at=insert_at,
-                remove_at=remove_at,
-            )
-
-        return top_row
-
-
-    def visual_tree_modifier_ui(self, u: ILoveUI, n: ModifierNode) -> Modifying:
-        return text_field(u, n.ui_state, Ref.from_attr(n, 'modifier_value').value_changed(lambda _, _1: self.on_tree_changed()))
-
-
-    def visual_tree_widget_ui(self, u: ILoveUI, n: WidgetNode) -> Modifying:
-        @column_content(u)
-        def top(u: ILoveUI):
-
-            text(u, n.widget_value, color=self.style.widget_text) \
-                .background(self.style.widget_bg)
-
-            @row_content(u)
-            def args_row(u: ILoveUI):
-                text(u, 'args: ', color=self.style.widget_text) \
-                    .background(self.style.widget_bg)
-
-                def insert_arg_at(idx: int):
-                    n.args.insert(idx, ContentNode())
-                    self.on_tree_changed()
-
-                def remove_at(idx: int):
-                    del n.args[idx]
-                    self.on_tree_changed()
-
-                def swap_at(idx: int, idx1: int):
-                    t = n.args[idx]
-                    n.args[idx] = n.args[idx1]
-                    n.args[idx1] = t
-                    self.on_tree_changed()
-
-                manageable_list(
-                    u,
-                    n.args,
-                    element_ui=lambda u, _, e: self.visual_tree_content_ui(u, e) if isinstance(e, ContentNode) else self.python_code_ui(u, e),
-                    insert_at=insert_arg_at,
-                    remove_at=remove_at,
-                    swap_at=swap_at,
-                )
-
-            @row_content(u)
-            def modifiers_row(u: ILoveUI):
-                text(u, 'modifiers: ', color=self.style.widget_text) \
-                    .background(self.style.widget_bg)
-
-                def insert_at(idx: int):
-                    n.modifiers.insert(idx, ModifierNode('new modifier'))
-                    self.on_tree_changed()
-
-                def remove_at(idx: int):
-                    del n.modifiers[idx]
-                    self.on_tree_changed()
-
-                def swap_at(idx: int, idx1: int):
-                    t = n.modifiers[idx]
-                    n.modifiers[idx] = n.modifiers[idx1]
-                    n.modifiers[idx1] = t
-                    self.on_tree_changed()
-
-                manageable_list(
-                    u,
-                    n.modifiers,
-                    element_ui=lambda u, _, e: self.visual_tree_modifier_ui(u, e),
-                    insert_at=insert_at,
-                    remove_at=remove_at,
-                    swap_at=swap_at,
-                )
-
-        return top \
-            .background(gray)
+    def visual_tree_content_ui(self, u: ILoveUI) -> Modifying:
+        return self.root_content.visual_tree_ui(u, self)
 
 
 
@@ -3164,7 +3343,7 @@ class VisualEditor:
         @row_content(u)
         def top_row(u: ILoveUI):
 
-            self.tree.visual_tree_content_ui(u, self.tree.root_content) \
+            self.tree.visual_tree_content_ui(u) \
                 .v_scroll(self.id / 'tree v_scroll') \
                 .h_scroll(self.id / 'tree h_scroll') \
                 .flex()
