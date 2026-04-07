@@ -816,6 +816,8 @@ class Modifying:
         self.placeable = scroll_modifier(state, p, horizontal=True, friction=friction, mouse_wheel_speed=mouse_wheel_speed, scissor=scissor, out_scope=out_scope)
         return self
 
+
+
 @dataclass(slots=True)
 class ScrollState:
     scroll: float = 0
@@ -932,9 +934,6 @@ def scroll_modifier(
             ctx.context.renderer.push_scissor(ctx.rect, for_render=False) # 用于拦截事件
             ctx.deferred_render_tick(lambda: ctx.context.renderer.pop_scissor(), RenderOperateType.scissor_op) # defer 从下到上执行
 
-        # if scissor:
-        #     element_ui = Modifying(element_ui).scissor().placeable # todo why
-
         element_ui.place_fn(child_ctx)
 
         if scissor:
@@ -944,6 +943,8 @@ def scroll_modifier(
         ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, Color(30, 30, 30)))
 
     return Placeable(40, element_ui.min_height, place_fn) if horizontal else Placeable(element_ui.min_width, 40, place_fn)
+
+
 
 class EventManager:
     def __init__(self) -> None:
@@ -1361,13 +1362,14 @@ def lazy_list_row(
     return lazy_list_linear(u, id, lst, horizontal=True, lst_element_ui=lst_element_ui, list_spacing=list_spacing)
 
 LAZY_LIST_TRY_RENDER_COUNT = 4
-LAZY_LIST_TAIL_SPACING = 400
+LAZY_LIST_TAIL_SPACING = 1024
 
 @dataclass(slots=True)
 class LazyListState:
     first: bool = True
+    start_index: int = 0
+    start_offset: float = 0
     scroll_scope: ScrollScope = field(default_factory=ScrollScope)
-    element_size: float = -1
     scroll_state: ScrollState = field(default_factory=ScrollState)
 
 def lazy_list_linear(
@@ -1383,35 +1385,47 @@ def lazy_list_linear(
         state.first = False
         def linear_content(u: ILoveUI):
             for i in range(min(LAZY_LIST_TRY_RENDER_COUNT, len(lst))):
-                ui = lst_element_ui(u, lst[i])
-                element_min_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
-                if i == 0:
-                    state.element_size = element_min_size + list_spacing
-                else:
-                    state.element_size = (state.element_size + element_min_size + list_spacing) / 2
+                lst_element_ui(u, lst[i])
+
     else:
         def linear_content(u: ILoveUI):
-            offset = int(state.scroll_scope.viewport_offset // state.element_size)
-            offset = clamp(0, offset, len(lst))
-            length = int((state.scroll_scope.viewport_length + state.element_size - 1) // state.element_size)
-            length = clamp(0, length, len(lst) - offset)
+            idx = clamp(0, state.start_index, len(lst))
+            space = state.scroll_scope.viewport_length
 
-            pad_head = offset * state.element_size
-            if horizontal:
-                spacing(u, pad_head, 0)
-            else:
-                spacing(u, 0, pad_head)
+            pad_head_spacing = spacing(u, state.start_offset, 0) if horizontal else spacing(u, 0, state.start_offset)
 
-            for i in range(offset, offset + length):
-                ui = lst_element_ui(u, lst[i])
-                element_min_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
-                state.element_size = (state.element_size + element_min_size + list_spacing) / 2
+            if idx >= 1 and state.scroll_scope.viewport_offset - state.start_offset < 0: # 列表上有空间时移动元素窗口
+                ui = lst_element_ui(u, lst[idx - 1])
+                ui_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
 
-            if offset + length < len(lst):
+                state.start_offset -= ui_size + list_spacing
+                state.start_index -= 1
+
+                p = pad_head_spacing.placeable
                 if horizontal:
-                    spacing(u, LAZY_LIST_TAIL_SPACING, 0)
+                    pad_head_spacing.placeable = Placeable(p.min_width - ui_size - list_spacing, p.min_height, p.place_fn)
                 else:
-                    spacing(u, 0, LAZY_LIST_TAIL_SPACING)
+                    pad_head_spacing.placeable = Placeable(p.min_width, p.min_height - ui_size - list_spacing, p.place_fn)
+
+            while True:
+                if idx >= len(lst):
+                    break
+
+                if space <= 0:
+                    break
+
+                ui = lst_element_ui(u, lst[idx])
+                ui_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
+
+                if idx < len(lst) - 1 and state.scroll_scope.viewport_offset - state.start_offset > ui_size + list_spacing: # 元素被上滑出列表时移动元素窗口
+                    state.start_offset += ui_size + list_spacing
+                    state.start_index += 1
+
+                space -= ui_size + list_spacing
+                idx += 1
+
+            if idx < len(lst):
+                spacing(u, LAZY_LIST_TAIL_SPACING, 0) if horizontal else spacing(u, 0, LAZY_LIST_TAIL_SPACING)
 
     ui = linear(u, horizontal=horizontal, content=linear_content, spacing=list_spacing)
 
@@ -1960,39 +1974,26 @@ def touchpad(u: ILoveUI, touchpad_vec: Ref[tuple[float, float]], touchpad_handle
 
 
 
-def checkbox(u: ILoveUI, id: UIPath, checked: Ref[bool]) -> Modifying:
-    def toggle_checked(_):
-        checked.value = not checked.value
+def checkbox(u: ILoveUI, checked: Ref[bool], id: UIPath | None = None) -> Modifying:
+    def place_fn(ctx: PlaceContext):
+        align_x = 1 if checked.value else 0
 
-    def checkbox_handle_modifier(p: Placeable) -> Placeable:
-        def place_fn(ctx: PlaceContext):
-            new_rect = ctx.rect.sub_rect_with_align(ctx.rect.h, ctx.rect.h, 1 if checked.value else 0, 0)
-            p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
+        if id is not None:
+            last_align_x: list[float] = (id / 'checkbox state').remember(lambda: [align_x])
+            align_x = (3 * last_align_x[0] + align_x) / 4
+            last_align_x[0] = align_x
 
-        return Placeable(p.min_width, p.min_height, place_fn)
+        def render():
+            rect = ctx.rect
+            slider_rect = ctx.rect.sub_rect_with_align(ctx.rect.h, ctx.rect.h, align_x, 0)
+            ctx.context.renderer.fill_rect(rect, gray)
+            ctx.context.renderer.fill_rect(Rect(rect.x, rect.y, slider_rect.x - rect.x, rect.h), green)
+            ctx.context.renderer.fill_rect(slider_rect, white)
 
-    @box_content(u)
-    def top_box(u: ILoveUI):
-        spacing(u) \
-            .background(Color(255, 255, 255)) \
-            .animated_rect(id / 'animated_rect 1') \
-            .modifier(checkbox_handle_modifier)
+        ctx.deferred_render_tick(render)
 
-        @row_content(u)
-        def green_gray_row(u: ILoveUI):
-            spacing(u, 0, 0) \
-                .flex(1 if checked.value else 0) \
-                .background(green) \
-                .animated_rect(id / 'animated_rect 0')
-
-            spacing(u, 0, 0) \
-                .flex(0 if checked.value else 1) \
-                .background(gray) \
-                .animated_rect(id / 'animated_rect 2')
-
-    return top_box \
-        .ratio_expend(2, 1) \
-        .clickable(None, toggle_checked)
+    return u.element(place_fn) \
+        .clickable(highlight, lambda _: checked.set(not checked.value))
 
 
 
@@ -2043,9 +2044,8 @@ def manageable_list(
             hover = False
             def consume_event(e: HoveringEvent) -> bool:
                 nonlocal hover
-                in_rect = e.finger.in_rect(ctx, True)
-                hover = in_rect
-                return in_rect
+                hover = e.finger.in_rect(ctx, True)
+                return False
 
             ctx.context.event_manager.consume_events(HoveringEvent, consume_event)
 
@@ -2063,8 +2063,8 @@ def manageable_list(
         def with_remove_button_row(u: ILoveUI):
             text(u, '-') \
                 .min_size_xy(12, 0) \
-                .modifier(enable_if_hover) \
-                .clickable(highlight, lambda _: remove_at(idx)) # type: ignore
+                .clickable(highlight, lambda _: remove_at(idx)) \
+                .modifier(enable_if_hover)
 
             element_ui(u, idx, e)
 
@@ -2682,6 +2682,7 @@ def ui_renderer_ui(
 
         context = state.target_ui_u.context
         if state.sync_events:
+            state.target_ui_u.context.event_manager.before_render()
             for type, events in ctx.context.event_manager.event_by_type.items():
                 for event in events:
                     context.event_manager.send_event_instantly(type, event)
@@ -2712,6 +2713,8 @@ def ui_renderer_ui(
         ctx.deferred_render_tick_listeners += lst
 
     return u.element(place_fn)
+
+
 
 def debug_ui_rect_control_ui(u: ILoveUI, ui_rect_ref: Ref[Rect | None], show_rect_ref: Ref[bool]) -> Modifying:
     @row_content(u)
@@ -2926,11 +2929,11 @@ class FastDebug:
         def open_v_finger_window(u: ILoveUI):
             @window_content(u, single_window_key=id / 'v_finger_window', layout=column)
             def render_layer_window(u: ILoveUI, ctx: PopupContext):
-                checkbox(u, id / 'intercept events checkbox', Ref.from_attr(self, 'intercept_events')) \
+                checkbox(u, Ref.from_attr(self, 'intercept_events'), id / 'intercept events checkbox') \
                     .flex() \
                     .tag_up(u, 'intercept events', id / 'intercept events checkbox tag', text_color=checkbox_text_color)
 
-                checkbox(u, id / 'show v finger checkbox', Ref.from_attr(self, 'show_v_finger')) \
+                checkbox(u, Ref.from_attr(self, 'show_v_finger'), id / 'show v finger checkbox') \
                     .flex() \
                     .tag_up(u, 'show v-finger', id / 'show v finger checkbox tag', text_color=checkbox_text_color)
 
@@ -2960,7 +2963,7 @@ class FastDebug:
 
             @row_content(u)
             def control_row(u: ILoveUI):
-                checkbox(u, id / 'scissor checkbox', Ref(u.context.renderer.get_scissor_enabled, u.context.renderer.set_scissor_enabled)) \
+                checkbox(u, Ref(u.context.renderer.get_scissor_enabled, u.context.renderer.set_scissor_enabled), id / 'scissor checkbox') \
                     .flex() \
                     .tag_up(u, 'scissor', id / 'scissor checkbox tag', text_color=checkbox_text_color)
 
@@ -3023,13 +3026,17 @@ class FastStart:
         self.screen_rect = screen_rect
         self.fps = 0.0
 
+        if not ctx.fingers:
+            ctx.fingers.append(Finger(0, 0))
+
 
 
     def handle_pygame_event(self, e: pygame.event.Event):
         ctx = self.ctx
 
         if e.type == pygame.VIDEORESIZE:
-            self.screen_rect = Rect(0, 0, e.size[0], e.size[1])
+            w, h = e.size
+            self.screen_rect = Rect(0, 0, w, h)
 
         elif e.type == pygame.TEXTINPUT:
             self.ctx.event_manager.send_event(TextInputEvent, TextInputEvent(e.text))
@@ -3568,7 +3575,7 @@ def test_screen_content(u: ILoveUI, fps: float):
                 open_window_button(u, test_ui_state.ui_root / 'open_window_button')
 
                 checked = (test_ui_state.ui_root / 'checked').remember(lambda: Ref.new_box(False))
-                checkbox(u, test_ui_state.ui_root / 'check_box', checked) \
+                checkbox(u, checked, test_ui_state.ui_root / 'check_box') \
                     .expend_xy(80, 0)
 
             buttons_row.expend_xy(0, 20)
