@@ -1,7 +1,11 @@
 import dataclasses
+import functools
+import inspect
+import itertools
 import pygame
 import random
 import time
+import traceback
 
 from abc import ABC, abstractmethod
 from asyncio import CancelledError
@@ -19,6 +23,278 @@ def clamp(min_value: T, value: T, max_value: T) -> T:
     if max_value < value: # type: ignore
         return max_value
     return value
+
+
+
+def log_func(exprs: list[str] | None = None) -> Callable:
+    """
+    装饰器：打印函数入参、返回值，以及指定表达式的求值结果
+
+    :param exprs: 函数作用域内的表达式字符串列表（如 ["a + b", "len(items)"]）
+    """
+    exprs = exprs if exprs is not None else []  # 默认为空列表
+
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # 1. 打印函数名和入参
+            func_name = func.__name__
+            print(f"==== 调用函数: {func_name} ====")
+
+            # 获取参数名和对应的值（结合位置参数和关键字参数）
+            sig = inspect.signature(func)
+            params = sig.parameters
+            args_dict = {}
+
+            # 处理位置参数
+            for i, (param_name, _) in enumerate(params.items()):
+                if i >= len(args):
+                    break
+                # 位置参数已处理完，剩下的可能是关键字参数或默认值
+                args_dict[param_name] = args[i]
+
+            # 处理关键字参数
+            args_dict.update(kwargs)
+
+            # 打印入参
+            print("入参:")
+            for name, value in args_dict.items():
+                print(f"  {name} = {value}")
+
+            # 2. 执行函数并获取返回值
+            result = func(*args, **kwargs)
+
+            # 3. 计算并打印指定的表达式（在函数作用域内求值）
+            if exprs:
+                print("表达式结果:")
+                # 获取函数作用域的局部变量和全局变量
+                # 注意：需结合函数实际执行时的栈帧获取局部变量
+                locals_dict = args_dict
+
+                for expr in exprs:
+                    try:
+                        # 在函数作用域内求值表达式
+                        expr_value = eval(expr, None, locals_dict)
+                        print(f"  {expr} = {expr_value}")
+                    except Exception as e:
+                        print(f"  表达式 '{expr}' 求值失败: {e}")
+                        print(f"  {locals_dict = }")
+
+            # 4. 打印返回值
+            print(f"返回值: {result}")
+            print(f"==== 函数 {func_name} 执行结束 ====\n")
+
+            return result
+        return wrapper
+    return decorator
+
+# ==================== text ====================
+
+import array
+
+NEW_LINE = ord('\n')
+
+@dataclass(slots=True)
+class Chars:
+    chars: array.array = field(default_factory=lambda: array.array('i'))
+    positions: array.array = field(default_factory=lambda: array.array('f', [0]))
+
+    def size(self) -> int:
+        return len(self.chars)
+
+    def get_codepoint(self, idx: int, default: int = -1) -> int:
+        size = self.size()
+        return self.chars[idx] if 0 <= idx < size else default
+
+    def insert_char(self, idx: int, codepoint: int, pos: float):
+        self.chars.insert(idx, codepoint)
+        self.positions.insert(idx, pos)
+
+    def delete_char(self, idx: int):
+        del self.chars[idx]
+        del self.positions[idx]
+
+    def is_at_line_start(self, idx: int) -> bool:
+        if not (0 <= idx <= self.size()):
+            raise ValueError(f'not (0 <= {idx} <= self.size())')
+
+        return idx == 0 or self.chars[idx - 1] == NEW_LINE
+
+    def is_at_line_end(self, idx: int) -> bool:
+        if not (0 <= idx <= self.size()):
+            raise ValueError(f'not (0 <= {idx} <= self.size())')
+
+        return self.chars[idx] == NEW_LINE
+
+
+@dataclass(slots=True)
+class TextManager:
+    line_height: float
+    get_codepoint_width: Callable[[int], float]
+    get_kerning: Callable[[int, int], float]
+
+    chars: Chars = field(default_factory=Chars)
+
+    def get_text(self) -> str:
+        t = self.chars.chars
+        t = map(lambda x: chr(x), t)
+        return ''.join(t)
+    
+    def update_line_position(self, idx: int):
+        size = self.chars.size()
+
+        if self.chars.is_at_line_start(idx):
+            self.chars.positions[idx] = 0
+            idx += 1
+
+        while idx <= size and self.chars.chars[idx - 1] != NEW_LINE:
+            left = self.chars.chars[idx - 1]
+            left_pos = self.chars.positions[idx - 1]
+            left_width = self.get_codepoint_width(left)
+            kerning = self.get_kerning(left, self.chars.chars[idx]) if idx < size else 0
+
+            self.chars.positions[idx] = left_pos + left_width + kerning
+            idx += 1
+
+    def insert_char(self, idx: int, codepoint: int):
+        self.chars.insert_char(idx, codepoint, 0)
+        self.update_line_position(idx)
+        if codepoint == NEW_LINE:
+            self.update_line_position(idx + 1)
+
+    def delete_char(self, idx: int) -> bool:
+        if not (0 <= idx < self.chars.size()):
+            return False
+
+        self.chars.delete_char(idx)
+        self.update_line_position(idx)
+        return True
+
+    def find_line_start(self, row: int) -> int:
+        '''
+        return: 该行第一个字符索引 或 size
+        '''
+        if row < 0:
+            raise ValueError(row)
+
+        idx = 0
+        while row > 0:
+            while True:
+                if idx >= self.chars.size():
+                    return self.chars.size()
+
+                if self.chars.chars[idx] == NEW_LINE:
+                    idx += 1
+                    break
+
+                idx += 1
+
+            row -= 1
+        return idx
+
+    def hit_char_idx(self, x: float, y: float) -> int:
+        row = int(y // self.line_height)
+        line_start = self.find_line_start(row)
+        return self.hit_char_idx_in_line(line_start, x)
+
+    def hit_char_idx_in_line(self, line_start_idx: int, pos: float) -> int:
+        '''
+        return: hit idx
+        '''
+        idx = line_start_idx
+        size = self.chars.size()
+        while idx < size and self.chars.chars[idx] != NEW_LINE:
+            if self.chars.positions[idx] > pos:
+                idx -= 1
+                break
+            idx += 1
+
+        return max(idx, line_start_idx)
+
+    def get_line_number(self, idx: int) -> int:
+        size = self.chars.size()
+        if not (0 <= idx <= size):
+            raise ValueError(f'{idx} not in [{0}, {size}]')
+
+        line_number = sum(1 for x in range(idx) if self.chars.chars[x] == NEW_LINE)
+        return line_number
+
+    def get_line_start(self, idx_in_line: int) -> int:
+        '''
+        return: 该行第一个字符索引
+        '''
+        size = self.chars.size()
+        if not (0 <= idx_in_line <= size):
+            raise ValueError(idx_in_line)
+
+        if idx_in_line == 0:
+            return 0
+
+        start = idx_in_line - 1
+        while start > 0 and self.chars.chars[start] != NEW_LINE:
+            start -= 1
+
+        if start != 0:
+            start += 1
+
+        return start
+
+    def get_line_end(self, idx_in_line: int) -> int:
+        '''
+        return: 换行符索引 或 self.chars.size()
+        '''
+        size = self.chars.size()
+        if not (0 <= idx_in_line <= size):
+            raise ValueError(idx_in_line)
+
+        end = idx_in_line
+        while end < size and self.chars.chars[end] != NEW_LINE:
+            end += 1
+        return end
+
+@dataclass(slots=True)
+class EditableTextManager:
+    text: TextManager
+    _cursor: int = 0
+    cursor_x: float = 0
+
+    @property
+    def cursor(self):
+        return self._cursor
+
+    @cursor.setter
+    def cursor(self, value: int):
+        self._cursor = clamp(0, value, self.text.chars.size())
+        self.update_cursor_x()
+
+    def update_cursor_x(self):
+        self.cursor_x = self.text.chars.positions[self.cursor]
+
+    @property
+    def line_number(self) -> int:
+        return self.text.get_line_number(self.cursor)
+
+    def insert_char(self, codepoint: int):
+        self.text.insert_char(self.cursor, codepoint)
+        self.cursor += 1
+
+    def delete_char(self):
+        if self.text.delete_char(self.cursor - 1):
+            self.cursor -= 1
+
+    def set_cursor_by_hit(self, x: float, y: float):
+        self.cursor = self.text.hit_char_idx(x, y)
+
+    def move_up(self): #rrr
+        line_start = self.text.get_line_start(self.cursor)
+        line_start = self.text.get_line_start(line_start - 1) if line_start - 1 > 0 else 0
+        self._cursor = self.text.hit_char_idx_in_line(line_start, self.cursor_x) # 不更新 self.cursor_x
+
+    def move_down(self):
+        line_end = self.text.get_line_end(self.cursor)
+        if line_end + 1 <= self.text.chars.size():
+            self._cursor = self.text.hit_char_idx_in_line(line_end + 1, self.cursor_x) # 不更新 self.cursor_x
+
 
 # ==================== api collect ====================
 
@@ -843,7 +1119,6 @@ def scroll_modifier(
     check_scissor_rect: bool = True,
     out_scope: ScrollScope | None = None
 ) -> Placeable:
-
     def place_fn(ctx: PlaceContext):
         nonlocal element_ui
         total_content_size = element_ui.min_width if horizontal else element_ui.min_height
@@ -854,7 +1129,7 @@ def scroll_modifier(
         state.last_time = now
 
         #惯性
-        if abs(state.velocity) > 0.1:
+        if not state.dragging and abs(state.velocity) > 0.1:
             state.scroll += state.velocity * dt
             state.velocity *= friction
 
@@ -875,7 +1150,7 @@ def scroll_modifier(
             d = e.scroll_x if horizontal else e.scroll_y
             d *= mouse_wheel_speed
             state.scroll += d
-            state.velocity = d / dt
+            state.velocity = (3 * state.velocity + d / dt) / 4
 
             return d != 0
 
@@ -1635,6 +1910,41 @@ def linear(u: ILoveUI, horizontal: bool, spacing: float, content: Callable[[ILov
 
     return u.element(place_fn, min_width=min_width, min_height=min_height)
 
+# ==================== focus ====================
+
+def is_focused(u: ILoveUI, id: UIPath) -> bool:
+    focus_manager = u.context.remember(FocusManager, FocusManager)
+    return focus_manager.focused_ui_path == id
+
+def focusable_modifier(u: ILoveUI, id: UIPath, p: Placeable) -> Placeable:
+    focus_manager = u.context.remember(FocusManager, FocusManager)
+    def add_invisible_unfocus_click_layer():
+        @popup_content(u)
+        def popup_layer(u: ILoveUI, ctx: PopupContext):
+            def unfocus(_):
+                ctx.close()
+                if focus_manager.focused_ui_path == id:
+                    focus_manager.focused_ui_path = None
+
+            if focus_manager.focused_ui_path != id:
+                ctx.close()
+
+            ctx.set_to_top()
+            spacing(u).on_touchdown(unfocus)
+
+    def place_fn(ctx: PlaceContext):
+        def consume_new_finger_event(e: NewFingerEvent) -> bool:
+            in_rect = e.finger.in_rect(ctx, True)
+            if in_rect and focus_manager.focused_ui_path != id:
+                focus_manager.focused_ui_path = id
+                add_invisible_unfocus_click_layer()
+            return False
+
+        ctx.context.event_manager.consume_events(NewFingerEvent, consume_new_finger_event)
+
+        p.place_fn(ctx)
+    return Placeable(p.min_width, p.min_height, place_fn)
+
 # ==================== widgets ====================
 
 def spacing_copy_size(u: ILoveUI, copy_size_from: Modifying) -> Modifying:
@@ -1662,6 +1972,161 @@ def text(u: ILoveUI, s: str, id: UIPath | None = None, color: Color = white) -> 
 class FocusManager:
     focused_ui_path: UIPath | None = None
 
+
+
+@dataclass(slots=True)
+class TextField2:
+    renderer: Renderer | None = None
+    glyphs: dict[int, Renderer.Renderable] = field(default_factory=lambda: {})
+    et: EditableTextManager = field(init=False)
+
+    last_blink: float = 0
+    blink_state: bool = True
+    last_cursor_visual_x: float = 0
+    last_cursor_visual_y: float = 0
+    min_width: float = 60
+    min_height: float = 30
+
+    def __post_init__(self):
+        def get_width(codepoint: int) -> float:
+            return self.get_glyph(codepoint).min_width
+
+        def get_kerning(_, _1) -> float:
+            return 0
+
+        self.et = EditableTextManager(TextManager(30, get_width, get_kerning))
+
+    @property
+    def cursor_pos(self) -> int:
+        return self.et.cursor
+
+    @cursor_pos.setter
+    def cursor_pos(self, value: int):
+        self.et.cursor = value
+
+    def get_text(self) -> str:
+        return self.et.text.get_text()
+
+    def show_cursor(self):
+        self.last_blink = time.time()
+        self.blink_state = True
+
+    def get_glyph(self, codepoint: int) -> Renderer.Renderable:
+        glyph = self.glyphs.get(codepoint)
+        if glyph is None:
+            is_new_line = codepoint == NEW_LINE
+            s = r'\n' if is_new_line else chr(codepoint)
+            if self.renderer is None:
+                raise ValueError()
+            glyph = self.renderer.draw_text(s)
+            self.glyphs[codepoint] = glyph
+            self.et.text.line_height = glyph.min_height
+
+        return glyph
+
+    def text_field2(self, u: ILoveUI, id: UIPath) -> Modifying:
+        self.renderer = u.context.renderer
+        et = self.et
+
+        def place_fn(ctx: PlaceContext):
+            active = is_focused(u, id)
+
+            if active:
+                def consume_text_input_event(e: TextInputEvent) -> bool:
+                    for c in e.text:
+                        et.insert_char(ord(c))
+                        self.show_cursor()
+                    return True
+                ctx.context.event_manager.consume_events(TextInputEvent, consume_text_input_event)
+
+                def consume_key_event(e: KeyEvent) -> bool:
+                    if not e.isDown:
+                        return False
+
+                    if e.keycode == pygame.K_UP: #ttt
+                        self.et.move_up()
+                    elif e.keycode == pygame.K_DOWN:
+                        self.et.move_down()
+                    # 左箭头：光标左移
+                    elif e.keycode == pygame.K_LEFT:
+                        self.cursor_pos = max(0, self.cursor_pos - 1)
+                    # 右箭头：光标右移
+                    elif e.keycode == pygame.K_RIGHT:
+                        self.cursor_pos = min(self.et.text.chars.size(), self.cursor_pos + 1)
+                    # HOME 键：跳到行开头
+                    elif e.keycode == pygame.K_HOME:
+                        self.cursor_pos = self.et.text.get_line_start(self.et.cursor)
+                    # END 键：跳到行末尾
+                    elif e.keycode == pygame.K_END:
+                        self.cursor_pos = self.et.text.get_line_end(self.et.cursor)
+                    # 换行
+                    elif e.keycode == pygame.K_RETURN:
+                        self.et.insert_char(NEW_LINE)
+                    # 退格键：删除光标左侧字符
+                    elif e.keycode == pygame.K_BACKSPACE:
+                        self.et.delete_char()
+                    else:
+                        return False
+
+                    self.show_cursor()
+                    return True
+                ctx.context.event_manager.consume_events(KeyEvent, consume_key_event)
+
+            now = time.time()
+            if now - self.last_blink > 0.5:
+                self.blink_state = not self.blink_state
+                self.last_blink = now
+
+            @ctx.deferred_render_tick
+            def render():
+                offset_y = 0
+                text_field_min_width = 0
+                for i in range(et.text.chars.size()):
+                    codepoint = et.text.chars.chars[i]
+                    renderable = self.get_glyph(codepoint)
+
+                    pos = et.text.chars.positions[i]
+                    width = renderable.min_width
+
+                    text_field_min_width = max(text_field_min_width, pos)
+
+                    renderable.render(Rect(ctx.rect.x + pos, ctx.rect.y + offset_y, width, et.text.line_height))
+
+                    is_new_line = codepoint == NEW_LINE
+                    if is_new_line:
+                        offset_y += et.text.line_height
+
+                self.min_width = text_field_min_width
+                self.min_height = offset_y
+
+                if active:
+                    def mix(a: float, b: float) -> float:
+                        return (a * 3 + b) / 4
+
+                    row_number = self.et.line_number
+                    offset_x = self.et.text.chars.positions[self.cursor_pos] if 0 <= self.cursor_pos <= self.et.text.chars.size() else 0
+
+                    r = ctx.rect
+                    cx = r.x + offset_x
+                    cy = r.y + row_number * self.et.text.line_height
+
+                    cx = mix(self.last_cursor_visual_x, cx)
+                    cy = mix(self.last_cursor_visual_y, cy)
+
+                    self.last_cursor_visual_x = cx
+                    self.last_cursor_visual_y = cy
+
+                    if self.blink_state:
+                        cy1 = cy
+                        cy2 = cy + self.et.text.line_height
+                        ctx.context.renderer.draw_line(white, (cx, cy1), (cx, cy2), 2)
+
+        ui = u.element(place_fn, max(30, self.min_width), max(30, self.min_height))
+        ui.placeable = focusable_modifier(u, id, ui.placeable)
+        return ui
+
+
+
 @dataclass(slots=True)
 class TextFieldState:
     last_blink: float = 0
@@ -1684,33 +2149,15 @@ def get_cursor_prefix(lines: list[str], row: int, col: int) -> str:
     return row_str[:col]
 
 def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "type something...") -> Modifying:
-    focus_manager = u.context.remember(FocusManager, FocusManager)
-
-    def add_invisible_unfocus_click_layer():
-        @popup_content(u)
-        def popup_layer(u: ILoveUI, ctx: PopupContext):
-            def unfocus(_):
-                ctx.close()
-                if focus_manager.focused_ui_path == id:
-                    focus_manager.focused_ui_path = None
-
-            if focus_manager.focused_ui_path != id:
-                ctx.close()
-
-            ctx.set_to_top()
-            spacing(u).on_touchdown(unfocus)
-
     state = id.remember(TextFieldState)
 
     def place_fn(ctx: PlaceContext):
-        active = (focus_manager.focused_ui_path == id)
+        active = is_focused(u, id)
 
         def consume_new_finger_event(e: NewFingerEvent) -> bool:
             in_rect = e.finger.in_rect(ctx, True)
-            if in_rect and focus_manager.focused_ui_path != id:
-                focus_manager.focused_ui_path = id
+            if in_rect:
                 state.cursor_pos = len(text_ref.value)
-                add_invisible_unfocus_click_layer()
                 state.show_cursor()
 
             return in_rect
@@ -1749,12 +2196,12 @@ def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "t
                         state.cursor_pos = len(text)
                         state.show_cursor()
                         return True
+                    # 换行
                     elif e.keycode == pygame.K_RETURN:
                         text_ref.value = text[:state.cursor_pos] + '\n' + text[state.cursor_pos:]
                         state.cursor_pos += len('\n')  # 输入后光标右移
                         state.show_cursor()
                         return True
-                    # ====================== 精准删除功能 ↓↓↓ ======================
                     # 退格键：删除光标左侧字符
                     elif e.keycode == pygame.K_BACKSPACE:
                         if state.cursor_pos > 0:
@@ -1831,7 +2278,9 @@ def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "t
 
         ctx.deferred_render_tick(render)
 
-    return u.element(place_fn, state.min_width, state.min_height)
+    ui = u.element(place_fn, state.min_width, state.min_height)
+    ui.placeable = focusable_modifier(u, id, ui.placeable)
+    return ui
 
 def slider(u: ILoveUI, value_ref: Ref[float], min_val: float, max_val: float, check_scissor_rect: bool = True) -> Modifying:
     def place_fn(ctx: PlaceContext):
@@ -2696,6 +3145,7 @@ def ui_renderer_ui(
             try:
                 lst = place_component(ctx)
             except Exception as e:
+                traceback.print_exc()
                 dialog(u, f'{e}, {e.args}', lambda _: None, lambda: True)
                 state.target_ui = state.original_target_ui
                 lst = []
@@ -3596,7 +4046,9 @@ def test_screen_content(u: ILoveUI, fps: float):
             text_field(u, test_ui_state.ui_root / 'text_field 1', input_text_1) \
                 .padding_xy(20, 0)
 
-            text_field(u, test_ui_state.ui_root / 'text_field 2', input_text_2) \
+            # todo test
+            tf2 = (test_ui_state.ui_root / 'text_field 2 state').remember(TextField2, TextField2)
+            tf2.text_field2(u, test_ui_state.ui_root / 'text_field 2') \
                 .padding_xy(20, 0)
 
             spacing(u, 0, 10)
