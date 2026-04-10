@@ -137,9 +137,9 @@ class TextManager:
 
     def get_text(self) -> str:
         t = self.chars.chars
-        t = map(lambda x: chr(x), t)
+        t = map(chr, t)
         return ''.join(t)
-    
+
     def update_line_position(self, idx: int):
         size = self.chars.size()
 
@@ -264,7 +264,7 @@ class EditableTextManager:
 
     @cursor.setter
     def cursor(self, value: int):
-        self._cursor = clamp(0, value, self.text.chars.size())
+        self._cursor = value
         self.update_cursor_x()
 
     def update_cursor_x(self):
@@ -1683,10 +1683,7 @@ def lazy_list_linear(
                     pad_head_spacing.placeable = Placeable(p.min_width, p.min_height - ui_size - list_spacing, p.place_fn)
 
             while True:
-                if idx >= len(lst):
-                    break
-
-                if space <= 0:
+                if idx >= len(lst) or space <= 0:
                     break
 
                 ui = lst_element_ui(u, lst[idx])
@@ -1912,21 +1909,25 @@ def linear(u: ILoveUI, horizontal: bool, spacing: float, content: Callable[[ILov
 
 # ==================== focus ====================
 
-def is_focused(u: ILoveUI, id: UIPath) -> bool:
-    focus_manager = u.context.remember(FocusManager, FocusManager)
-    return focus_manager.focused_ui_path == id
+@dataclass(slots=True)
+class FocusManager:
+    focused_key: Any | None = None
 
-def focusable_modifier(u: ILoveUI, id: UIPath, p: Placeable) -> Placeable:
+def is_focused(u: ILoveUI, focus_key: Any) -> bool:
+    focus_manager = u.context.remember(FocusManager, FocusManager)
+    return focus_manager.focused_key == focus_key
+
+def focusable_modifier(u: ILoveUI, focus_key: Any, p: Placeable, on_focus: Callable[[], None] | None = None) -> Placeable:
     focus_manager = u.context.remember(FocusManager, FocusManager)
     def add_invisible_unfocus_click_layer():
         @popup_content(u)
         def popup_layer(u: ILoveUI, ctx: PopupContext):
             def unfocus(_):
                 ctx.close()
-                if focus_manager.focused_ui_path == id:
-                    focus_manager.focused_ui_path = None
+                if focus_manager.focused_key == focus_key:
+                    focus_manager.focused_key = None
 
-            if focus_manager.focused_ui_path != id:
+            if focus_manager.focused_key != focus_key:
                 ctx.close()
 
             ctx.set_to_top()
@@ -1935,9 +1936,11 @@ def focusable_modifier(u: ILoveUI, id: UIPath, p: Placeable) -> Placeable:
     def place_fn(ctx: PlaceContext):
         def consume_new_finger_event(e: NewFingerEvent) -> bool:
             in_rect = e.finger.in_rect(ctx, True)
-            if in_rect and focus_manager.focused_ui_path != id:
-                focus_manager.focused_ui_path = id
+            if in_rect and focus_manager.focused_key != focus_key:
+                focus_manager.focused_key = focus_key
                 add_invisible_unfocus_click_layer()
+                if on_focus is not None:
+                    on_focus()
             return False
 
         ctx.context.event_manager.consume_events(NewFingerEvent, consume_new_finger_event)
@@ -1968,17 +1971,15 @@ def text(u: ILoveUI, s: str, id: UIPath | None = None, color: Color = white) -> 
         min_height=text_renderer.min_height
     )
 
-@dataclass(slots=True)
-class FocusManager:
-    focused_ui_path: UIPath | None = None
-
 
 
 @dataclass(slots=True)
 class TextField2:
     renderer: Renderer | None = None
-    glyphs: dict[int, Renderer.Renderable] = field(default_factory=lambda: {})
+    glyphs: dict[int, Renderer.Renderable] = field(default_factory=dict)
     et: EditableTextManager = field(init=False)
+
+    focus_key: object = field(default_factory=object)
 
     last_blink: float = 0
     blink_state: bool = True
@@ -2029,7 +2030,7 @@ class TextField2:
         et = self.et
 
         def place_fn(ctx: PlaceContext):
-            active = is_focused(u, id)
+            active = is_focused(u, self.focus_key)
 
             if active:
                 def consume_text_input_event(e: TextInputEvent) -> bool:
@@ -2082,22 +2083,21 @@ class TextField2:
                 offset_y = 0
                 text_field_min_width = 0
                 for i in range(et.text.chars.size()):
-                    codepoint = et.text.chars.chars[i]
-                    renderable = self.get_glyph(codepoint)
-
                     pos = et.text.chars.positions[i]
-                    width = renderable.min_width
-
                     text_field_min_width = max(text_field_min_width, pos)
 
+                    codepoint = et.text.chars.chars[i]
+
+                    if codepoint == NEW_LINE:
+                        offset_y += et.text.line_height
+                        continue
+
+                    renderable = self.get_glyph(codepoint)
+                    width = renderable.min_width
                     renderable.render(Rect(ctx.rect.x + pos, ctx.rect.y + offset_y, width, et.text.line_height))
 
-                    is_new_line = codepoint == NEW_LINE
-                    if is_new_line:
-                        offset_y += et.text.line_height
-
                 self.min_width = text_field_min_width
-                self.min_height = offset_y
+                self.min_height = et.text.line_height + offset_y
 
                 if active:
                     def mix(a: float, b: float) -> float:
@@ -2122,8 +2122,9 @@ class TextField2:
                         ctx.context.renderer.draw_line(white, (cx, cy1), (cx, cy2), 2)
 
         ui = u.element(place_fn, max(30, self.min_width), max(30, self.min_height))
-        ui.placeable = focusable_modifier(u, id, ui.placeable)
-        return ui
+        ui.placeable = focusable_modifier(u, self.focus_key, ui.placeable, on_focus=self.show_cursor)
+        return ui \
+            .background(gray)
 
 
 
@@ -2136,23 +2137,21 @@ class TextFieldState:
     min_width: float = 60
     min_height: float = 30
 
+    focus_key: object = field(default_factory=object)
+
     cursor_pos: int = 0
 
     def show_cursor(self) -> None:
         self.last_blink = time.time()
         self.blink_state = True
 
-def get_cursor_prefix(lines: list[str], row: int, col: int) -> str:
-    if not (0 <= row < len(lines)):
-        return ''
-    row_str = lines[row]
-    return row_str[:col]
+
 
 def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "type something...") -> Modifying:
     state = id.remember(TextFieldState)
 
     def place_fn(ctx: PlaceContext):
-        active = is_focused(u, id)
+        active = is_focused(u, state.focus_key)
 
         def consume_new_finger_event(e: NewFingerEvent) -> bool:
             in_rect = e.finger.in_rect(ctx, True)
@@ -2279,7 +2278,7 @@ def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "t
         ctx.deferred_render_tick(render)
 
     ui = u.element(place_fn, state.min_width, state.min_height)
-    ui.placeable = focusable_modifier(u, id, ui.placeable)
+    ui.placeable = focusable_modifier(u, state.focus_key, ui.placeable)
     return ui
 
 def slider(u: ILoveUI, value_ref: Ref[float], min_val: float, max_val: float, check_scissor_rect: bool = True) -> Modifying:
@@ -3233,14 +3232,13 @@ class VFinger:
     state: VFingerState = VFingerState.up
     id: UIPath = field(default_factory=UIPath.root)
 
-
     def send_event(self, u: ILoveUI):
-        u.context.event_manager.send_event_instantly(HoveringEvent, HoveringEvent(self.finger))
+        u.context.event_manager.send_event(HoveringEvent, HoveringEvent(self.finger))
 
         match self.state:
             case VFingerState.up: ...
             case VFingerState.to_down:
-                u.context.event_manager.send_event_instantly(NewFingerEvent, NewFingerEvent(self.finger))
+                u.context.event_manager.send_event(NewFingerEvent, NewFingerEvent(self.finger))
                 self.state = VFingerState.down
 
             case VFingerState.down:
@@ -3260,10 +3258,8 @@ class VFinger:
         self.finger.x = self.x
         self.finger.y = self.y
 
-
     def set_state(self, value: VFingerState):
         self.state = value
-
 
     def v_finger(self, u: ILoveUI):
         def draggable_modifier(p: Placeable) -> Placeable:
