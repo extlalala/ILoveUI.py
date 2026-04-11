@@ -546,6 +546,7 @@ class Color:
 highlight = Color(255, 255, 255, 127)
 green = Color(20, 255, 20)
 gray = Color(20, 20, 20)
+transparent_black = Color(0, 0, 0, 128)
 white = Color(255, 255, 255)
 black = Color(0, 0, 0)
 
@@ -1003,12 +1004,36 @@ class Modifying:
         self.placeable = Placeable(ratio_x * unit, ratio_y * unit, p.place_fn)
         return self
 
+    def ratio_pad(self, ratio_x: int, ratio_y: int) -> Self:
+        p = self.placeable
+
+        def place_fn(ctx: PlaceContext):
+            unit = min(ctx.rect.w / ratio_x, ctx.rect.h / ratio_y)
+            w = ratio_x * unit
+            h = ratio_y * unit
+            new_rect = ctx.rect.sub_rect_with_align(w, h, 0.5, 0.5)
+            p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
+
+        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        return self
+
     def square_expend(self) -> Self:
         p = self.placeable
 
         size = max(p.min_width, p.min_height)
 
         self.placeable = Placeable(size, size, p.place_fn)
+        return self
+
+    def square_pad(self) -> Self:
+        p = self.placeable
+
+        def place_fn(ctx: PlaceContext):
+            size = min(ctx.rect.w, ctx.rect.h)
+            new_rect = ctx.rect.sub_rect_with_align(size, size, 0.5, 0.5)
+            p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
+
+        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
     def padding_xy(self, padding_x: float, padding_y: float) -> Self:
@@ -1493,10 +1518,11 @@ def window_content(
     initial_y: float = 200,
     layout: Callable[[ILoveUI, Callable[[ILoveUI], None]], Modifying] | None = None,
     with_close_button: bool = True,
+    close_layer: bool = False,
     single_window_key: UIPath | None = None,
 ) -> Callable[[Callable[[ILoveUI, PopupContext], None]], None]:
     def decorator(content: Callable[[ILoveUI, PopupContext], None]) -> None:
-        window(u, content, initial_x, initial_y, layout, with_close_button, single_window_key)
+        window(u, content, initial_x, initial_y, layout, with_close_button, close_layer, single_window_key)
     return decorator
 
 WINDOW_FRAME_SIZE = 14
@@ -1521,6 +1547,7 @@ def window(
     initial_y: float = 200,
     layout: Callable[[ILoveUI, Callable[[ILoveUI], None]], Modifying] | None = None,
     with_close_button: bool = True,
+    close_layer: bool = False,
     single_window_key: UIPath | None = None,
 ) -> None:
     if layout is None:
@@ -1599,6 +1626,9 @@ def window(
 
         min_w, min_h = content_ui.placeable.min_width, content_ui.placeable.min_height
         content_ui.with_rect(Rect(rect_x, rect_y, min_w, min_h))
+
+        if close_layer:
+            content_ui.clickable_background(transparent_black, lambda _: ctx.close())
 
 # ==================== layouts ====================
 
@@ -2237,7 +2267,7 @@ def text_field(u: ILoveUI, id: UIPath, text_ref: Ref[str], placeholder: str = "t
             y_offset = 0
             min_w = 60
             for textRenderer in textRenderers:
-                rect = Rect(r.x+8, y_offset + r.y, textRenderer.min_width, textRenderer.min_height)
+                rect = Rect(r.x, y_offset + r.y, textRenderer.min_width, textRenderer.min_height)
                 textRenderer.render(rect)
                 y_offset += textRenderer.min_height
                 min_w = max(min_w, textRenderer.min_width)
@@ -2315,7 +2345,7 @@ def slider(u: ILoveUI, value_ref: Ref[float], min_val: float, max_val: float, ch
 
     return u.element(place_fn, 30, 30)
 
-def number_input(u: ILoveUI, name_tag: str, value_ref: Ref[float], value_text_min_width: float = 0, level: int = 2, step: int = 10) -> Modifying:
+def number_input(u: ILoveUI, name_tag: str, value_ref: Ref, value_text_min_width: float = 0, level: int = 2, step: int = 10) -> Modifying:
     @row_content(u)
     def top_row(u: ILoveUI):
 
@@ -2470,9 +2500,17 @@ def manageable_list(
     lst: list[T],
     element_ui: Callable[[ILoveUI, int, T], Modifying],
     insert_at: Callable[[int], None] | None = None,
-    remove_at: Callable[[int], None] | None = None,
-    swap_at: Callable[[int, int], None] | None = None,
+    remove_at: Callable[[int], None] | None | Literal['default'] = 'default',
+    swap_at: Callable[[int, int], None] | None | Literal['default'] = 'default',
 ) -> Modifying:
+    if remove_at == 'default':
+        remove_at = lst.__delitem__
+
+    if swap_at == 'default':
+        def swap(a: int, b: int):
+            lst[a], lst[b] = lst[b], lst[a]
+
+        swap_at = swap
 
     def insert_and_swap_button(u: ILoveUI, idx: int) -> Modifying:
         @row_content(u)
@@ -2514,7 +2552,7 @@ def manageable_list(
                 .clickable(highlight, lambda _: remove_at(idx)) \
                 .modifier(enable_if_hover)
 
-            element_ui(u, idx, e)
+            element_ui(u, idx, e).flex()
 
         return with_remove_button_row
 
@@ -2875,7 +2913,7 @@ class PygameILoveUIRenderer(Renderer):
         self.scissor_stack: list[Rect] = []
         self.scissor_enabled = True
 
-        self.font = pygame.font.SysFont(['Arial', 'SimHei'], 24)
+        self.font = pygame.font.SysFont(['SimHei', 'Arial'], 24)
 
     def _bilt_screen(self):
         self.screen_surface.blit(self.buffer_surface, (0, 0))
@@ -4003,7 +4041,7 @@ def test_screen_content(u: ILoveUI, fps: float):
         @column_content(u)
         def top_column(u: ILoveUI):
             render_time_text(u, test_ui_state.ui_root / 'render_time_text') \
-                .tag_left(u, 'Render Time: ')
+                .tag_left(u, 'Render Time 时间: ')
 
             text(u, f'{fps:.4f}') \
                 .tag_left(u, 'fps: ') \
