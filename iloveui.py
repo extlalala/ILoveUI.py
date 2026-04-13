@@ -2,6 +2,7 @@ import dataclasses
 import functools
 import inspect
 import itertools
+import re
 import pygame
 import random
 import time
@@ -1091,6 +1092,19 @@ class Modifying:
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
+    def measure(self, id: UIPath, measure_fn: Callable[[float, float], tuple[float, float]]) -> Self:
+        p = self.placeable
+        constraints = id.remember(lambda: [p.min_width, p.min_height])
+
+        def place_fn(ctx: PlaceContext):
+            constraints[0] = ctx.rect.w
+            constraints[1] = ctx.rect.h
+            p.place_fn(ctx)
+
+        w, h = measure_fn(constraints[0], constraints[1]) # type: ignore
+        self.placeable = Placeable(w, h, place_fn)
+        return self
+
     def v_scroll(
         self,
         id: UIPath,
@@ -1637,8 +1651,8 @@ def lazy_list_column_content(
     lst: Sequence[T],
     list_spacing: float = 4
 ) -> Callable[[Callable[[ILoveUI, T], Modifying]], Modifying]:
-    def decorator(lst_element_ui: Callable[[ILoveUI, T], Modifying]) -> Modifying:
-        return lazy_list_column(u, id, lst, lst_element_ui=lst_element_ui, list_spacing=list_spacing)
+    def decorator(render_item: Callable[[ILoveUI, T], Modifying]) -> Modifying:
+        return lazy_list_column(u, id, lst, render_item=render_item, list_spacing=list_spacing)
     return decorator
 
 def lazy_list_row_content(
@@ -1646,80 +1660,84 @@ def lazy_list_row_content(
     lst: Sequence[T],
     list_spacing: float = 4
 ) -> Callable[[Callable[[ILoveUI, T], Modifying]], Modifying]:
-    def decorator(lst_element_ui: Callable[[ILoveUI, T], Modifying]) -> Modifying:
-        return lazy_list_row(u, id, lst, lst_element_ui=lst_element_ui, list_spacing=list_spacing)
+    def decorator(render_item: Callable[[ILoveUI, T], Modifying]) -> Modifying:
+        return lazy_list_row(u, id, lst, render_item=render_item, list_spacing=list_spacing)
     return decorator
 
 def lazy_list_column(
     u: ILoveUI, id: UIPath,
     lst: Sequence[T],
-    lst_element_ui: Callable[[ILoveUI, T], Modifying],
+    render_item: Callable[[ILoveUI, T], Modifying],
     list_spacing: float = 4
 ) -> Modifying:
-    return lazy_list_linear(u, id, lst, horizontal=False, lst_element_ui=lst_element_ui, list_spacing=list_spacing)
+    return lazy_list_linear(u, id, lst, horizontal=False, render_item=render_item, list_spacing=list_spacing)
 
 def lazy_list_row(
     u: ILoveUI, id: UIPath,
     lst: Sequence[T],
-    lst_element_ui: Callable[[ILoveUI, T], Modifying],
+    render_item: Callable[[ILoveUI, T], Modifying],
     list_spacing: float = 4
 ) -> Modifying:
-    return lazy_list_linear(u, id, lst, horizontal=True, lst_element_ui=lst_element_ui, list_spacing=list_spacing)
+    return lazy_list_linear(u, id, lst, horizontal=True, render_item=render_item, list_spacing=list_spacing)
 
 LAZY_LIST_TRY_RENDER_COUNT = 4
 LAZY_LIST_TAIL_SPACING = 1024
 
 @dataclass(slots=True)
 class LazyListState:
-    first: bool = True
+    first_render: bool = True
     start_index: int = 0
     start_offset: float = 0
     scroll_scope: ScrollScope = field(default_factory=ScrollScope)
     scroll_state: ScrollState = field(default_factory=ScrollState)
 
+    def first_item_overflow_size(self) -> float:
+        return self.scroll_scope.viewport_offset - self.start_offset
+
 def lazy_list_linear(
     u: ILoveUI, id: UIPath,
     lst: Sequence[T],
     horizontal: bool,
-    lst_element_ui: Callable[[ILoveUI, T], Modifying],
+    render_item: Callable[[ILoveUI, T], Modifying],
     list_spacing: float = 4
 ) -> Modifying:
     state = (id / 'lazy_list_state').remember(LazyListState)
 
-    if state.first:
-        state.first = False
+    if state.first_render:
+        state.first_render = False
         def linear_content(u: ILoveUI):
             for i in range(min(LAZY_LIST_TRY_RENDER_COUNT, len(lst))):
-                lst_element_ui(u, lst[i])
+                render_item(u, lst[i])
 
     else:
         def linear_content(u: ILoveUI):
-            idx = clamp(0, state.start_index, len(lst))
-            space = state.scroll_scope.viewport_length
+            idx = clamp(0, state.start_index, len(lst) - 1)
 
-            pad_head_spacing = spacing(u, state.start_offset, 0) if horizontal else spacing(u, 0, state.start_offset)
+            # 必须保证 (1) -> (2) 的顺序
 
-            if idx >= 1 and state.scroll_scope.viewport_offset - state.start_offset < 0: # 列表上有空间时移动元素窗口
-                ui = lst_element_ui(u, lst[idx - 1])
+            space = state.scroll_scope.viewport_length + state.first_item_overflow_size() # (1)
+
+            pad_head_spacing = spacing(u, state.start_offset, 0) if horizontal else spacing(u, 0, state.start_offset) # (1)
+
+            if idx >= 1 and state.first_item_overflow_size() < 0: # 列表上有空间时移动元素窗口
+                ui = render_item(u, lst[idx - 1]) # (2)
                 ui_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
 
-                state.start_offset -= ui_size + list_spacing
+                state.start_offset -= ui_size + list_spacing # (2)
                 state.start_index -= 1
 
                 p = pad_head_spacing.placeable
-                if horizontal:
-                    pad_head_spacing.placeable = Placeable(p.min_width - ui_size - list_spacing, p.min_height, p.place_fn)
-                else:
-                    pad_head_spacing.placeable = Placeable(p.min_width, p.min_height - ui_size - list_spacing, p.place_fn)
+                pad_head_spacing.placeable = Placeable(p.min_width - ui_size - list_spacing, p.min_height, p.place_fn) if horizontal else \
+                                             Placeable(p.min_width, p.min_height - ui_size - list_spacing, p.place_fn)
 
             while True:
                 if idx >= len(lst) or space <= 0:
                     break
 
-                ui = lst_element_ui(u, lst[idx])
+                ui = render_item(u, lst[idx])
                 ui_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
 
-                if idx < len(lst) - 1 and state.scroll_scope.viewport_offset - state.start_offset > ui_size + list_spacing: # 元素被上滑出列表时移动元素窗口
+                if idx < len(lst) - 1 and state.first_item_overflow_size() > ui_size + list_spacing: # 元素被上滑出列表时移动元素窗口
                     state.start_offset += ui_size + list_spacing
                     state.start_index += 1
 
@@ -3167,8 +3185,8 @@ def ui_renderer_ui(
         render_tick_listeners: list[RenderOperate] = []
 
         context = state.target_ui_u.context
+        state.target_ui_u.context.event_manager.before_render()
         if state.sync_events:
-            state.target_ui_u.context.event_manager.before_render()
             for type, events in ctx.context.event_manager.event_by_type.items():
                 for event in events:
                     context.event_manager.send_event_instantly(type, event)
@@ -4010,10 +4028,9 @@ def test_scroll_ui(u: ILoveUI, id: UIPath) -> Modifying:
     @lazy_list_column_content(u, id / 'lazy column', range(12000000))
     def element_buttons(u: ILoveUI, i: int) -> Modifying:
         return element_button(u, i, element_id / i) \
-            .expend_xy(0, 10)
+            .measure(element_id / 'measure' / i, lambda w, _: (w, w * 0.618))
 
-    return element_buttons \
-        .expend_xy(40, 80)
+    return element_buttons
 
 
 
