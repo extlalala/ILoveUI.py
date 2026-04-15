@@ -1,8 +1,6 @@
 import dataclasses
 import functools
 import inspect
-import itertools
-import re
 import pygame
 import random
 import time
@@ -27,7 +25,7 @@ def clamp(min_value: T, value: T, max_value: T) -> T:
 
 
 
-def log_func(exprs: list[str] | None = None) -> Callable:
+def log_func(func: Callable | None = None, exprs: list[str] | None = None) -> Callable:
     """
     装饰器：打印函数入参、返回值，以及指定表达式的求值结果
 
@@ -87,7 +85,8 @@ def log_func(exprs: list[str] | None = None) -> Callable:
 
             return result
         return wrapper
-    return decorator
+
+    return decorator(func) if func else decorator
 
 # ==================== text ====================
 
@@ -99,6 +98,10 @@ NEW_LINE = ord('\n')
 class Chars:
     chars: array.array = field(default_factory=lambda: array.array('i'))
     positions: array.array = field(default_factory=lambda: array.array('f', [0]))
+    '''
+    每个字符的左侧位置
+    大小始终比 chars 多 1
+    '''
 
     def size(self) -> int:
         return len(self.chars)
@@ -462,9 +465,39 @@ class Finger:
 class NewFingerEvent:
     finger: Finger
 
+    @staticmethod
+    def consume_events(ctx: 'PlaceContext', fn: Callable[['NewFingerEvent'], bool | None] | None = None) -> Callable[[Callable[['NewFingerEvent'], bool | None]], None]:
+        def decorator(fn: Callable[['NewFingerEvent'], bool | None]):
+            def listener(e: NewFingerEvent) -> bool:
+                if not e.finger.in_rect(ctx):
+                    return False
+
+                ret = fn(e)
+                return ret if ret is not None else True
+
+            ctx.context.event_manager.consume_events(NewFingerEvent, listener)
+
+        return decorator(fn) if fn else decorator # type: ignore
+
 @dataclass(slots=True)
 class HoveringEvent:
     finger: Finger
+
+    @staticmethod
+    def is_hovering(ctx: 'PlaceContext', consume_events: bool = True) -> bool:
+        hovering = False
+
+        def listener(e: HoveringEvent) -> bool:
+            nonlocal hovering
+            if not e.finger.in_rect(ctx):
+                return False
+
+            hovering = True
+            return consume_events
+
+        ctx.context.event_manager.consume_events(HoveringEvent, listener)
+
+        return hovering
 
 @dataclass(slots=True)
 class TextInputEvent:
@@ -573,6 +606,9 @@ class Rect:
 
     def to_tuple(self) -> tuple[float, float, float, float]:
         return (self.x, self.y, self.w, self.h)
+
+    def with_offset(self, offset_x: float, offset_y: float) -> 'Rect':
+        return Rect(self.x + offset_x, self.y + offset_y, self.w, self.h)
 
     def sub_rect_with_align(self, new_w: float, new_h: float, align_x: float, align_y: float) -> 'Rect':
         x = self.x + (self.w - new_w) * align_x
@@ -1074,10 +1110,10 @@ class Modifying:
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
-    def getRect(self, outRect: Ref[Rect]) -> Self:
+    def get_rect(self, out_rect: Callable[[Rect], None]) -> Self:
         p = self.placeable
         def place_fn(ctx: PlaceContext):
-            outRect.value = ctx.rect
+            out_rect(ctx.rect)
             p.place_fn(ctx)
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
@@ -1106,6 +1142,39 @@ class Modifying:
 
         w, h = measure_fn(constraints[0], constraints[1]) # type: ignore
         self.placeable = Placeable(w, h, place_fn)
+        return self
+
+    def draggable(self, offset: Ref[tuple[float, float]]) -> Self:
+        p = self.placeable
+
+        def place_fn(ctx: PlaceContext):
+            p.place_fn(ctx)
+
+            @NewFingerEvent.consume_events(ctx)
+            def consume_new_finger_event(e: NewFingerEvent):
+                origin_x, origin_y = offset.value
+                offset_x = e.finger.x - origin_x
+                offset_y = e.finger.y - origin_y
+
+                @e.finger.on_drag
+                def on_drag(finger: Finger):
+                    offset.value = (finger.x - offset_x, finger.y - offset_y)
+
+        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        return self
+
+    def scroll(
+        self,
+        id: UIPath,
+        friction: float = 0.92,
+        mouse_wheel_speed: float = -8,
+        scissor: bool = True,
+        out_scope: 'ScrollScope | None' = None
+    ) -> Self:
+        p = self.placeable
+        h_state, v_state = id.remember(lambda: (ScrollState(), ScrollState()))
+        self.placeable = scroll_modifier(h_state, p, horizontal=True, friction=friction, mouse_wheel_speed=mouse_wheel_speed, scissor=scissor, out_scope=out_scope)
+        self.placeable = scroll_modifier(v_state, p, horizontal=False, friction=friction, mouse_wheel_speed=mouse_wheel_speed, scissor=scissor, out_scope=out_scope)
         return self
 
     def v_scroll(
@@ -1331,14 +1400,20 @@ class ILoveUIContext:
     def remember(self, cls_as_key: type[T], calc: Callable[[], T]) -> T:
         return self.type_value_map.remember(cls_as_key, calc)
 
-    def place_in(self, rect: Rect, place_fn: Callable[[PlaceContext], None]) -> None:
-        render_tick_listeners: list[RenderOperate] = []
+    def place_in(
+        self,
+        rect: Rect,
+        place_fn: Callable[[PlaceContext], None],
+        out_render_tick_listeners: list[RenderOperate] | None = None
+    ) -> None:
+        render_tick_listeners: list[RenderOperate] = out_render_tick_listeners if out_render_tick_listeners is not None else []
 
         place_ctx = PlaceContext(rect, self, render_tick_listeners)
         place_fn(place_ctx)
 
-        for operate in reversed(render_tick_listeners):
-            operate.operate_fn()
+        if out_render_tick_listeners is None:
+            for operate in reversed(render_tick_listeners):
+                operate.operate_fn()
 
     def to_placeable(
         self,
@@ -1355,10 +1430,11 @@ class ILoveUIContext:
         self,
         rect: Rect,
         content: Callable[['ILoveUI'], None],
-        layout: Callable[['ILoveUI', Callable[['ILoveUI'], None]], Modifying] | None = None
+        layout: Callable[['ILoveUI', Callable[['ILoveUI'], None]], Modifying] | None = None,
+        out_render_tick_listeners: list[RenderOperate] | None = None
     ) -> None:
         placeable = self.to_placeable(content, layout=layout)
-        self.place_in(rect, placeable.place_fn)
+        self.place_in(rect, placeable.place_fn, out_render_tick_listeners)
 
 class ILoveUI:
     '''
@@ -1529,6 +1605,41 @@ def dialog(
             .align_xy(0.5, 0.5) \
             .clickable_background(Color(0, 0, 0, 80), cancel_dialog)
 
+
+
+def def_window(
+    content: Callable[[ILoveUI, PopupContext], None] | None = None,
+    *,
+    initial_x: float = 100,
+    initial_y: float = 200,
+    layout: Callable[[ILoveUI, Callable[[ILoveUI], None]], Modifying] | None = None,
+    with_close_button: bool = True,
+    close_layer: bool = False,
+    single_window_key: UIPath | None = None,
+):
+    def decorator(content: Callable[[ILoveUI, PopupContext], None]) -> Callable[[ILoveUI], None]:
+        def open_window(u: ILoveUI) -> None:
+            window(u, content, initial_x, initial_y, layout, with_close_button, close_layer, single_window_key)
+        return open_window
+
+    return decorator(content) if content else decorator
+
+def def_popup_layer(
+    content: Callable[[ILoveUI, PopupContext], Modifying] | None = None,
+):
+    def decorator(content: Callable[[ILoveUI, PopupContext], Modifying]) -> Callable[[ILoveUI], None]:
+        def open_popup(u: ILoveUI) -> None:
+            @popup_content(u)
+            def popup_top(u: ILoveUI, ctx: PopupContext):
+                content(u, ctx) \
+                    .background(gray) \
+                    .padding_xy(40, 40) \
+                    .clickable_background(transparent_black, lambda _: ctx.close())
+
+        return open_popup
+
+    return decorator(content) if content else decorator
+
 def window_content(
     u: ILoveUI,
     initial_x: float = 100,
@@ -1648,6 +1759,12 @@ def window(
             content_ui.clickable_background(transparent_black, lambda _: ctx.close())
 
 # ==================== layouts ====================
+
+def use_layout(layout: Callable[[ILoveUI, Callable[[ILoveUI], None]], Modifying]) -> Callable[[Callable[[ILoveUI], None]], Callable[[ILoveUI], Modifying]]:
+    def decorator(content: Callable[[ILoveUI], None]) -> Callable[[ILoveUI], Modifying]:
+        return lambda u, *args, **kwargs: layout(u, lambda u: content(u, *args, **kwargs))
+
+    return decorator
 
 def lazy_list_column_content(
     u: ILoveUI, id: UIPath,
@@ -2021,6 +2138,11 @@ def text(u: ILoveUI, s: str, id: UIPath | None = None, color: Color = white) -> 
         min_width=text_renderer.min_width,
         min_height=text_renderer.min_height
     )
+
+def rendering(u: ILoveUI, render_fn: Callable[[PlaceContext], None]) -> Modifying:
+    def place_fn(ctx: PlaceContext):
+        ctx.deferred_render_tick(lambda: render_fn(ctx))
+    return u.element(place_fn)
 
 
 
@@ -2549,6 +2671,8 @@ def manageable_list(
     insert_at: Callable[[int], None] | None = None,
     remove_at: Callable[[int], None] | None | Literal['default'] = 'default',
     swap_at: Callable[[int, int], None] | None | Literal['default'] = 'default',
+    item_spacing: float = 4,
+    horizontal: bool = False,
 ) -> Modifying:
     if remove_at == 'default':
         remove_at = lst.__delitem__
@@ -2560,29 +2684,20 @@ def manageable_list(
         swap_at = swap
 
     def insert_and_swap_button(u: ILoveUI, idx: int) -> Modifying:
-        @row_content(u)
-        def buttons_row(u: ILoveUI):
+        def buttons_linear(u: ILoveUI):
             text(u, '+') \
                 .clickable(highlight, lambda _: insert_at(idx)) # type: ignore
 
             if swap_at is not None and (0 < idx < len(lst)):
-                text(u, '^v') \
+                text(u, '<>' if horizontal else '^v') \
                     .clickable(highlight, lambda _: swap_at(idx - 1, idx)) # type: ignore
 
-        return buttons_row
+        return linear(u, not horizontal, 4, buttons_linear)
 
 
     def enable_if_hover(p: Placeable) -> Placeable:
         def place_fn(ctx: PlaceContext):
-            hover = False
-            def consume_event(e: HoveringEvent) -> bool:
-                nonlocal hover
-                hover = e.finger.in_rect(ctx, True)
-                return False
-
-            ctx.context.event_manager.consume_events(HoveringEvent, consume_event)
-
-            if hover:
+            if HoveringEvent.is_hovering(ctx, consume_events=False):
                 p.place_fn(ctx)
 
         return Placeable(p.min_width, p.min_height, place_fn)
@@ -2592,8 +2707,7 @@ def manageable_list(
         if remove_at is None:
             return element_ui(u, idx, e)
 
-        @row_content(u)
-        def with_remove_button_row(u: ILoveUI):
+        def with_remove_button_linear(u: ILoveUI):
             text(u, '-') \
                 .min_size_xy(12, 0) \
                 .clickable(highlight, lambda _: remove_at(idx)) \
@@ -2601,11 +2715,10 @@ def manageable_list(
 
             element_ui(u, idx, e).flex()
 
-        return with_remove_button_row
+        return linear(u, not horizontal, 4, with_remove_button_linear)
 
 
-    @column_content(u)
-    def elements_col(u: ILoveUI):
+    def elements_linear(u: ILoveUI):
         for i, e in enumerate(lst):
             if insert_at is not None:
                 insert_and_swap_button(u, i) \
@@ -2619,7 +2732,7 @@ def manageable_list(
             if lst:
                 ui.modifier(enable_if_hover)
 
-    return elements_col
+    return linear(u, horizontal=horizontal, spacing=item_spacing, content=elements_linear)
 
 
 
@@ -4013,7 +4126,7 @@ def open_window_button(u: ILoveUI, id: UIPath) -> Modifying:
             .clickable(highlight, open_more_window, background_color=Color(100, 100, 100, 255))
 
     return buttons_row \
-        .getRect(rect_ref)
+        .get_rect(rect_ref.set)
 
 
 
