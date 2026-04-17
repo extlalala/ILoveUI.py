@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import dataclasses
 import functools
 import inspect
@@ -1459,6 +1460,10 @@ class ILoveUI:
         placeable = Placeable(min_width=min_width, min_height=min_height, place_fn=place_fn)
         return self.element_placeable(placeable)
 
+    @property
+    def last(self) -> Modifying:
+        return self.children[-1]
+
 # ==================== popup system ====================
 
 @dataclass(slots=True)
@@ -1925,19 +1930,6 @@ def memo(
 
 
 def box_content(u: ILoveUI) -> Callable[[Callable[[ILoveUI], None]], Modifying]:
-    '''
-    ```
-    @box_content(u)
-    def my_ui(u: ILoveUI):
-        ...
-    ```
-    相当于
-    ```
-    def my_ui(u: ILoveUI):
-        ...
-    box(u, my_ui)
-    ```
-    '''
     def decorator(content: Callable[[ILoveUI], None]) -> Modifying:
         return box(u, content)
     return decorator
@@ -1949,34 +1941,62 @@ def box(u: ILoveUI, content: Callable[[ILoveUI], None]) -> Modifying:
     '''
     child_u = ILoveUI(u.context)
     content(child_u)
+    return box_layout(u, child_u.children)
 
+def box_layout(u: ILoveUI, children: list[Modifying]) -> Modifying:
     min_width = 0
     min_height = 0
 
-    for ui in child_u.children:
+    for ui in children:
         min_width = max(min_width, ui.placeable.min_width)
         min_height = max(min_height, ui.placeable.min_height)
 
     def place_fn(ctx: PlaceContext):
-        for ui in child_u.children:
+        for ui in children:
             ui.placeable.place_fn(ctx)
 
     return u.element(place_fn, min_width, min_height)
 
+@contextmanager
+def box_ctx(u: ILoveUI):
+    upper = u.children
+    inner = []
+
+    try:
+        u.children = inner
+        yield
+    finally:
+        u.children = upper
+
+    box_layout(u, inner)
+
+@contextmanager
+def row_ctx(u: ILoveUI, spacing: float = 4):
+    upper = u.children
+    inner = []
+
+    try:
+        u.children = inner
+        yield
+    finally:
+        u.children = upper
+
+    linear_layout(u, horizontal=True, spacing=spacing, children=inner)
+
+@contextmanager
+def column_ctx(u: ILoveUI, spacing: float = 4):
+    upper = u.children
+    inner = []
+
+    try:
+        u.children = inner
+        yield
+    finally:
+        u.children = upper
+
+    linear_layout(u, horizontal=False, spacing=spacing, children=inner)
+
 def row_content(u: ILoveUI, spacing: float = 4) -> Callable[[Callable[[ILoveUI], None]], Modifying]:
-    '''
-    ```
-    @row_content(u)
-    def my_ui(u: ILoveUI):
-        ...
-    ```
-    相当于
-    ```
-    def my_ui(u: ILoveUI):
-        ...
-    row(u, my_ui)
-    ```
-    '''
     def decorator(content: Callable[[ILoveUI], None]) -> Modifying:
         return row(u, content, spacing=spacing)
     return decorator
@@ -1989,19 +2009,6 @@ def row(u: ILoveUI, content: Callable[[ILoveUI], None], spacing: float = 4) -> M
     return linear(u, horizontal=True, spacing=spacing, content=content)
 
 def column_content(u: ILoveUI, spacing: float = 4) -> Callable[[Callable[[ILoveUI], None]], Modifying]:
-    '''
-    ```
-    @column_content(u)
-    def my_ui(u: ILoveUI):
-        ...
-    ```
-    相当于
-    ```
-    def my_ui(u: ILoveUI):
-        ...
-    column(u, my_ui)
-    ```
-    '''
     def decorator(content: Callable[[ILoveUI], None]) -> Modifying:
         return column(u, content, spacing=spacing)
     return decorator
@@ -2016,13 +2023,15 @@ def column(u: ILoveUI, content: Callable[[ILoveUI], None], spacing: float = 4) -
 def linear(u: ILoveUI, horizontal: bool, spacing: float, content: Callable[[ILoveUI], None]) -> Modifying:
     child_u = ILoveUI(u.context)
     content(child_u)
+    return linear_layout(u, horizontal, spacing, children=child_u.children)
 
+def linear_layout(u: ILoveUI, horizontal: bool, spacing: float, children: list[Modifying]) -> Modifying:
     min_width = 0
     min_height = 0
     fixed_size = 0
     total_weight = 0
 
-    for ui in child_u.children:
+    for ui in children:
         total_weight += ui.flex_weight
 
         if ui.flex_weight == 0:
@@ -2035,7 +2044,7 @@ def linear(u: ILoveUI, horizontal: bool, spacing: float, content: Callable[[ILov
             min_width = max(min_width, ui.placeable.min_width)
             min_height += ui.placeable.min_height
 
-    total_spacing = max(0, len(child_u.children) - 1) * spacing
+    total_spacing = max(0, len(children) - 1) * spacing
     if horizontal:
         min_width += total_spacing
     else:
@@ -2050,7 +2059,7 @@ def linear(u: ILoveUI, horizontal: bool, spacing: float, content: Callable[[ILov
         weight_to_flex_size_factor = total_flex_size / total_weight if total_weight != 0 else 0
 
         # 如果比例分配的大小不够, 转为固定大小
-        for ui in child_u.children:
+        for ui in children:
             if ui.flex_weight != 0:
                 flex_size = ui.flex_weight * weight_to_flex_size_factor
                 required_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
@@ -2061,7 +2070,7 @@ def linear(u: ILoveUI, horizontal: bool, spacing: float, content: Callable[[ILov
                     ui.flex_weight = 0
 
         base = ctx.rect.x if horizontal else ctx.rect.y
-        for ui in child_u.children:
+        for ui in children:
 
             if ui.flex_weight == 0:
                 child_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
@@ -2515,8 +2524,7 @@ def slider(u: ILoveUI, value_ref: Ref[float], min_val: float, max_val: float, ch
     return u.element(place_fn, 30, 30)
 
 def number_input(u: ILoveUI, name_tag: str, value_ref: Ref, value_text_min_width: float = 0, level: int = 2, step: int = 10) -> Modifying:
-    @row_content(u)
-    def top_row(u: ILoveUI):
+    with row_ctx(u):
 
         def number_modify_button(u: ILoveUI, show: str, delta_value: int) -> Modifying:
             def set_value(_) -> None:
@@ -2545,7 +2553,7 @@ def number_input(u: ILoveUI, name_tag: str, value_ref: Ref, value_text_min_width
         if level >= 3:
             number_modify_button(u, '>>>', step * step)
 
-    return top_row
+    return u.last
 
 def number_pad(u: ILoveUI, number_typed: Callable[[int], None], id: UIPath | None = None) -> Modifying:
     def number_button(u: ILoveUI, number: int) -> Modifying:
@@ -2554,29 +2562,26 @@ def number_pad(u: ILoveUI, number_typed: Callable[[int], None], id: UIPath | Non
             .clickable(highlight, lambda _: number_typed(number), background_color=Color(40, 40, 40))
 
     def number_row(u: ILoveUI, n1: int, n2: int, n3: int) -> Modifying:
-        @row_content(u)
-        def number_row_ui(u: ILoveUI):
+        with row_ctx(u):
             number_button(u, n1)
             number_button(u, n2)
             number_button(u, n3)
 
-        return number_row_ui.flex()
+        return u.last.flex()
 
-    @column_content(u)
-    def top_column(u: ILoveUI):
+    with column_ctx(u):
         number_row(u, 1, 2, 3)
         number_row(u, 4, 5, 6)
         number_row(u, 7, 8, 9)
 
-        @row_content(u)
-        def number0_row(u: ILoveUI):
+        with row_ctx(u):
             spacing(u).flex()
             number_button(u, 0)
             spacing(u).flex()
 
-        number0_row.flex()
+        u.last.flex()
 
-    return top_column
+    return u.last
 
 def default_touchpad_handle(u: ILoveUI) -> Modifying:
     return text(u, 'O') \
@@ -2609,13 +2614,12 @@ def touchpad(u: ILoveUI, touchpad_vec: Ref[tuple[float, float]], touchpad_handle
             p.place_fn(ctx)
         return Placeable(p.min_width, p.min_height, place_fn)
 
-    @box_content(u)
-    def touchpad_box(u: ILoveUI):
+    with box_ctx(u):
         touchpad_handle(u) \
             .square_expend() \
             .align_xy(touchpad_vec.value[0], touchpad_vec.value[1])
 
-    return touchpad_box \
+    return u.last \
         .expend_xy(20, 20) \
         .modifier(touchpad_modifier)
 
@@ -2645,14 +2649,13 @@ def checkbox(u: ILoveUI, checked: Ref[bool], id: UIPath | None = None) -> Modify
 
 
 def rect_control_ui(u: ILoveUI, rect_ref: Ref[Rect]) -> Modifying:
-    @column_content(u)
-    def control_column(u: ILoveUI):
+    with column_ctx(u):
         number_input(u, 'x: ', Ref(lambda: rect_ref.value.x, lambda value: rect_ref.set(dataclasses.replace(rect_ref.value, x=value))), value_text_min_width=80, level=3)
         number_input(u, 'y: ', Ref(lambda: rect_ref.value.y, lambda value: rect_ref.set(dataclasses.replace(rect_ref.value, y=value))), value_text_min_width=80, level=3)
         number_input(u, 'w: ', Ref(lambda: rect_ref.value.w, lambda value: rect_ref.set(dataclasses.replace(rect_ref.value, w=value))), value_text_min_width=80, level=3)
         number_input(u, 'h: ', Ref(lambda: rect_ref.value.h, lambda value: rect_ref.set(dataclasses.replace(rect_ref.value, h=value))), value_text_min_width=80, level=3)
 
-    return control_column
+    return u.last
 
 
 
@@ -2867,38 +2870,33 @@ def bitmap_advanced_ui(
     # ======================
     # 布局：组合所有内容
     # ======================
-    @column_content(u)
-    def root(u: ILoveUI):
+    with column_ctx(u):
 
         # 控制面板
         # ======================
         # 布局：控制面板行
         # ======================
-        @row_content(u)
-        def control_panel(u: ILoveUI):
+        with row_ctx(u):
 
-            @column_content(u)
-            def range_column(u: ILoveUI):
+            with column_ctx(u):
                 number_input(u, "Start", start_ref, step=row_byte_count).flex() # type: ignore
                 number_input(u, "End", end_ref, step=row_byte_count).flex() # type: ignore
 
-            range_column.flex()
+            u.last.flex()
 
-            @column_content(u)
-            def range_buttons(u: ILoveUI):
+            with column_ctx(u):
                 text(u, "flip range").clickable(highlight, flip_range).flex()
                 text(u, "fill range 0").clickable(highlight, lambda _: fill_range(0)).flex()
                 text(u, "fill range 1").clickable(highlight, lambda _: fill_range(1)).flex()
 
-            range_buttons.flex()
+            u.last.flex()
 
-            @column_content(u)
-            def global_buttons(u: ILoveUI):
+            with column_ctx(u):
                 text(u, "flip all").clickable(highlight, flip_all).flex()
                 text(u, "all 1").clickable(highlight, lambda _: set_all(_, 1)).flex()
                 text(u, "all 0").clickable(highlight, lambda _: set_all(_, 0)).flex()
 
-            global_buttons.flex()
+            u.last.flex()
 
         # 分隔线
         spacing(u, 0, 8)
@@ -2911,7 +2909,7 @@ def bitmap_advanced_ui(
             byte_ui_by_index=byte_ui_by_index
         ).flex()
 
-    return root
+    return u.last
 
 def bitmap_ui(
     u: ILoveUI, id: UIPath,
@@ -2957,8 +2955,7 @@ def bitmap_ui(
     def byte_rows_col(u: ILoveUI, row_number: int) -> Modifying:
         row_start_index = row_number * row_byte_count
 
-        @row_content(u)
-        def bytes_row(u: ILoveUI) -> None:
+        with row_ctx(u):
             text(u, str(row_start_index), id / row_start_index) \
                 .min_size_xy(40, 0)
 
@@ -2981,7 +2978,7 @@ def bitmap_ui(
                 .min_size_xy(40, 40) \
                 .clickable(highlight, flip_row)
 
-        return bytes_row \
+        return u.last \
             .ratio_expend(row_byte_count, 1)
 
     return byte_rows_col
@@ -2990,24 +2987,22 @@ def single_component_rgba_color_selector(u: ILoveUI, component_ref: Ref[int]) ->
     return slider(u, Ref(component_ref.get, lambda value: component_ref.set(int(value))), 0, 255)
 
 def rgba_color_selector(u: ILoveUI, color_ref: Ref[Color]) -> Modifying:
-    @row_content(u)
-    def top_row(u: ILoveUI):
+    with row_ctx(u):
 
-        @column_content(u)
-        def rgba_sliders_col(u: ILoveUI):
+        with column_ctx(u):
             c = color_ref.value
             single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.r, lambda value: color_ref.set(Color(value, c.g, c.b, c.a)))).flex()
             single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.g, lambda value: color_ref.set(Color(c.r, value, c.b, c.a)))).flex()
             single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.b, lambda value: color_ref.set(Color(c.r, c.g, value, c.a)))).flex()
             single_component_rgba_color_selector(u, Ref(lambda: color_ref.value.a, lambda value: color_ref.set(Color(c.r, c.g, c.b, value)))).flex()
 
-        rgba_sliders_col.flex(4)
+        u.last.flex(4)
 
         spacing(u) \
             .background(color_ref.value) \
             .flex()
 
-    return top_row \
+    return u.last \
         .min_size_xy(40, 0) \
         .ratio_expend(5, 1)
 
@@ -3042,12 +3037,11 @@ def preview(*args, **kwargs) -> Callable[[Callable], Callable]:
 
 
 def preview_layer(u: ILoveUI, id: UIPath):
-    @column_content(u)
-    def top(u: ILoveUI):
+    with column_ctx(u):
         for widget in preview_widgets or ():
             widget(u)
 
-    top.v_scroll(id)
+    u.last.v_scroll(id)
 
 
 
@@ -3249,13 +3243,11 @@ def render_layer_control_ui(u: ILoveUI, max_layer: int, state: RenderLayerManage
         layer = value
         state.layer = value
 
-    @column_content(u)
-    def top_col(u: ILoveUI):
+    with column_ctx(u):
 
         spacing(u, 20, 20)
 
-        @row_content(u)
-        def slider_row(u: ILoveUI):
+        with row_ctx(u):
             text(u, '<') \
                 .square_expend() \
                 .clickable(highlight, lambda _: set_layer(layer - 1))
@@ -3269,8 +3261,7 @@ def render_layer_control_ui(u: ILoveUI, max_layer: int, state: RenderLayerManage
                 .square_expend() \
                 .clickable(highlight, lambda _: set_layer(layer + 1))
 
-        @row_content(u)
-        def buttons_row(u: ILoveUI):
+        with row_ctx(u):
 
             def toggle_mode(_) -> None:
                 state.render_mode = state.render_mode.next_mode()
@@ -3285,7 +3276,7 @@ def render_layer_control_ui(u: ILoveUI, max_layer: int, state: RenderLayerManage
             .flex() \
             .background(gray)
 
-    return top_col \
+    return u.last \
         .square_expend()
 
 @dataclass(slots=True)
@@ -3364,8 +3355,7 @@ def ui_renderer_ui(
 
 
 def debug_ui_rect_control_ui(u: ILoveUI, ui_rect_ref: Ref[Rect | None], show_rect_ref: Ref[bool]) -> Modifying:
-    @row_content(u)
-    def rect_control_row(u: ILoveUI):
+    with row_ctx(u):
         def get_rect() -> Rect:
             return ui_rect_ref.value if ui_rect_ref.value is not None else Rect(0, 0, 200, 200)
 
@@ -3377,17 +3367,16 @@ def debug_ui_rect_control_ui(u: ILoveUI, ui_rect_ref: Ref[Rect | None], show_rec
         def flip_show_rect(_):
             show_rect_ref.value = not show_rect_ref.value
 
-        @column_content(u)
-        def buttons_col(u: ILoveUI):
+        with column_ctx(u):
             text(u, 'show rect') \
                 .clickable(highlight, flip_show_rect, background_color=green if show_rect_ref.value else gray)
 
             text(u, 'reset') \
                 .clickable(highlight, lambda _: ui_rect_ref.set(None), background_color=gray)
 
-        buttons_col.align_xy(None, 0.5)
+        u.last.align_xy(None, 0.5)
 
-    return rect_control_row
+    return u.last
 
 def render_code_ui(u: ILoveUI, id: UIPath, target_ui_ref: Ref[Callable[[ILoveUI, 'FastStartContext'], None]]) -> Modifying:
     code_ref = (id / 'code_ref').remember(lambda: Ref.new_box(''))
@@ -3399,8 +3388,7 @@ def render_code_ui(u: ILoveUI, id: UIPath, target_ui_ref: Ref[Callable[[ILoveUI,
         except Exception as e:
             dialog(u, f'{e}, {e.args}', lambda _: None, lambda: True)
 
-    @column_content(u)
-    def top(u: ILoveUI):
+    with column_ctx(u):
 
         text_field(u, id / 'code input', code_ref) \
             .flex() \
@@ -3410,7 +3398,7 @@ def render_code_ui(u: ILoveUI, id: UIPath, target_ui_ref: Ref[Callable[[ILoveUI,
         text(u, 'submit') \
             .clickable(highlight, submit_code, gray)
 
-    return top
+    return u.last
 
 
 
@@ -3496,8 +3484,7 @@ class VFinger:
 
             return Placeable(p.min_width, p.min_height, place_fn)
 
-        @row_content(u)
-        def top(u: ILoveUI):
+        with row_ctx(u):
             text(u, '<- v finger', color=black)
 
             match self.state:
@@ -3514,7 +3501,7 @@ class VFinger:
                     text(u, 'curr to up', color=black) \
                         .clickable(highlight, lambda _: self.set_state(VFingerState.down))
 
-        top \
+        u.last \
             .background(highlight, touch_through=True) \
             .modifier(draggable_modifier)
 
@@ -3591,8 +3578,7 @@ class FastDebug:
                 .background(highlight, touch_through=True) \
                 .with_rect(self.ui_rect)
 
-        @column_content(u)
-        def top_column(u: ILoveUI):
+        with column_ctx(u):
 
             if self.ui_renderer_ui_state is not None:
                 self.ui_renderer_ui_state.sync_events = not self.intercept_events
@@ -3605,8 +3591,7 @@ class FastDebug:
                 ) \
                     .flex()
 
-            @row_content(u)
-            def control_row(u: ILoveUI):
+            with row_ctx(u):
                 checkbox(u, Ref(u.context.renderer.get_scissor_enabled, u.context.renderer.set_scissor_enabled), id / 'scissor checkbox') \
                     .flex() \
                     .tag_up(u, 'scissor', id / 'scissor checkbox tag', text_color=checkbox_text_color)
@@ -3791,8 +3776,7 @@ class WidgetNode:
     ui_state: UIPath = field(default_factory=UIPath.root)
 
     def visual_tree_ui(self, u: ILoveUI, tree_ui: 'VisualTreeUI') -> Modifying:
-        @column_content(u)
-        def top(u: ILoveUI):
+        with column_ctx(u):
 
             text(u, self.widget_value, color=tree_ui.style.widget_text) \
                 .background(tree_ui.style.widget_bg)
@@ -3825,8 +3809,7 @@ class WidgetNode:
                     swap_at=swap_at,
                 )
 
-            @row_content(u)
-            def modifiers_row(u: ILoveUI):
+            with row_ctx(u):
                 text(u, 'modifiers: ', color=tree_ui.style.widget_text) \
                     .background(tree_ui.style.widget_bg)
 
@@ -3853,7 +3836,7 @@ class WidgetNode:
                     swap_at=swap_at,
                 )
 
-        return top \
+        return u.last \
             .background(gray)
 
 
@@ -3872,8 +3855,7 @@ class ContentNode:
     widgets: list['WidgetNode | PythonCode'] = field(default_factory=lambda: [])
 
     def visual_tree_ui(n, u: ILoveUI, self: 'VisualTreeUI') -> Modifying:
-        @row_content(u)
-        def top_row(u: ILoveUI):
+        with row_ctx(u):
             spacing(u, width=20) \
                 .background(self.style.content_bg)
 
@@ -3893,7 +3875,7 @@ class ContentNode:
                 remove_at=remove_at,
             )
 
-        return top_row
+        return u.last
 
 
 class VisualTreeDumper:
@@ -4115,8 +4097,7 @@ def open_window_button(u: ILoveUI, id: UIPath) -> Modifying:
         for _ in range(open_window_count):
             open_window(None)
 
-    @row_content(u)
-    def buttons_row(u: ILoveUI):
+    with row_ctx(u):
         text(u, 'window') \
             .expend_xy(10, 0) \
             .clickable(highlight, open_window, background_color=Color(100, 100, 100, 255))
@@ -4125,7 +4106,7 @@ def open_window_button(u: ILoveUI, id: UIPath) -> Modifying:
             .expend_xy(10, 0) \
             .clickable(highlight, open_more_window, background_color=Color(100, 100, 100, 255))
 
-    return buttons_row \
+    return u.last \
         .get_rect(rect_ref.set)
 
 
@@ -4149,12 +4130,11 @@ def fruits_ui(u: ILoveUI, id: UIPath, fruits_lst: list[str], selected_index: Ref
             .clickable(highlight, set_selected, background_color=Color(255, 80, 80) if fruit_index == selected_index.value else Color(80, 80, 255)) \
             .flex()
 
-    @row_content(u)
-    def fruits_row(u):
+    with row_ctx(u):
         for index, fruit in enumerate(fruits_lst):
             fruit_ui(u, index, fruit)
 
-    return fruits_row \
+    return u.last \
         .expend_xy(0, 20)
 
 
@@ -4192,13 +4172,11 @@ def test_screen_content(u: ILoveUI, fps: float):
         .expend_xy(40, 40) \
         .align_xy(None, 0.5)
 
-    @row_content(u)
-    def top_row(u: ILoveUI):
+    with row_ctx(u):
 
         test_scroll_ui(u, test_ui_state.ui_root / 'test_scroll_ui')
 
-        @column_content(u)
-        def top_column(u: ILoveUI):
+        with column_ctx(u):
             render_time_text(u, test_ui_state.ui_root / 'render_time_text') \
                 .tag_left(u, 'Render Time 时间: ')
 
@@ -4211,8 +4189,7 @@ def test_screen_content(u: ILoveUI, fps: float):
             text(u, f'{len(popup_manager.popups)}') \
                 .tag_left(u, 'popup count: ')
 
-            @row_content(u)
-            def buttons_row(u: ILoveUI):
+            with row_ctx(u):
                 sleep_button(u, test_ui_state.ui_root / 'sleep button')
                 hello_world_button(u)
                 open_window_button(u, test_ui_state.ui_root / 'open_window_button')
@@ -4221,7 +4198,7 @@ def test_screen_content(u: ILoveUI, fps: float):
                 checkbox(u, checked, test_ui_state.ui_root / 'check_box') \
                     .expend_xy(80, 0)
 
-            buttons_row.expend_xy(0, 20)
+            u.last.expend_xy(0, 20)
 
             fruits_ui(u, test_ui_state.ui_root / 'fruits ui', test_ui_state.fruits, Ref.from_attr(test_ui_state, 'selected'))
 
@@ -4278,17 +4255,16 @@ def test_screen_content(u: ILoveUI, fps: float):
                 return text(u, f'click me: {count_ref[0]}') \
                     .clickable(highlight, inc_count)
 
-            @row_content(u)
-            def stateful_test_row(u: ILoveUI):
+            with row_ctx(u):
                 id = test_ui_state.ui_root
                 click_inc_number_button(u, id / 'click_inc_number_button 1').flex()
                 click_inc_number_button(u, id / 'click_inc_number_button 2').flex()
 
-            stateful_test_row.expend_xy(0, 20)
+            u.last.expend_xy(0, 20)
 
-        top_column.flex()
+        u.last.flex()
 
-    top_row \
+    u.last \
         .animated_rect(test_ui_state.ui_root / 'top_column animate')
 
 def main():
