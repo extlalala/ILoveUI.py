@@ -1,7 +1,5 @@
-from contextlib import contextmanager
+import array
 import dataclasses
-import functools
-import inspect
 import pygame
 import random
 import time
@@ -9,6 +7,7 @@ import traceback
 
 from abc import ABC, abstractmethod
 from asyncio import CancelledError
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import auto, Enum
 from typing import Any, Callable, Coroutine, Generator, Generic, Hashable, Iterable, Literal, Sequence, Self, TypeVar
@@ -24,74 +23,7 @@ def clamp(min_value: T, value: T, max_value: T) -> T:
         return max_value
     return value
 
-
-
-def log_func(func: Callable | None = None, exprs: list[str] | None = None) -> Callable:
-    """
-    装饰器：打印函数入参、返回值，以及指定表达式的求值结果
-
-    :param exprs: 函数作用域内的表达式字符串列表（如 ["a + b", "len(items)"]）
-    """
-    exprs = exprs if exprs is not None else []  # 默认为空列表
-
-    def decorator(func: Callable) -> Callable:
-        @functools.wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            # 1. 打印函数名和入参
-            func_name = func.__name__
-            print(f"==== 调用函数: {func_name} ====")
-
-            # 获取参数名和对应的值（结合位置参数和关键字参数）
-            sig = inspect.signature(func)
-            params = sig.parameters
-            args_dict = {}
-
-            # 处理位置参数
-            for i, (param_name, _) in enumerate(params.items()):
-                if i >= len(args):
-                    break
-                # 位置参数已处理完，剩下的可能是关键字参数或默认值
-                args_dict[param_name] = args[i]
-
-            # 处理关键字参数
-            args_dict.update(kwargs)
-
-            # 打印入参
-            print("入参:")
-            for name, value in args_dict.items():
-                print(f"  {name} = {value}")
-
-            # 2. 执行函数并获取返回值
-            result = func(*args, **kwargs)
-
-            # 3. 计算并打印指定的表达式（在函数作用域内求值）
-            if exprs:
-                print("表达式结果:")
-                # 获取函数作用域的局部变量和全局变量
-                # 注意：需结合函数实际执行时的栈帧获取局部变量
-                locals_dict = args_dict
-
-                for expr in exprs:
-                    try:
-                        # 在函数作用域内求值表达式
-                        expr_value = eval(expr, None, locals_dict)
-                        print(f"  {expr} = {expr_value}")
-                    except Exception as e:
-                        print(f"  表达式 '{expr}' 求值失败: {e}")
-                        print(f"  {locals_dict = }")
-
-            # 4. 打印返回值
-            print(f"返回值: {result}")
-            print(f"==== 函数 {func_name} 执行结束 ====\n")
-
-            return result
-        return wrapper
-
-    return decorator(func) if func else decorator
-
 # ==================== text ====================
-
-import array
 
 NEW_LINE = ord('\n')
 
@@ -1496,7 +1428,7 @@ def popup_layer(u: ILoveUI) -> None:
     '''
     popupManager = u.context.remember(PopupManager, PopupManager)
 
-    def box_content(u: ILoveUI):
+    with box_ctx(u):
         to_top_popups: list[Popup] = []
 
         for i in range(len(popupManager.popups) - 1, -1, -1):
@@ -1515,7 +1447,6 @@ def popup_layer(u: ILoveUI) -> None:
 
         popupManager.popups += to_top_popups
 
-    box(u, box_content)
 
 
 def popup_content(u: ILoveUI) -> Callable[[Callable[[ILoveUI, PopupContext], None]], None]:
@@ -1586,14 +1517,12 @@ def dialog(
             yes_or_no(value)
             ctx.close()
 
-        @column_content(u)
-        def top_column(u: ILoveUI):
+        with column_ctx(u):
             text(u, text_str, popup_state / 'text_str') \
                 .expend_xy(20, 20) \
                 .flex()
 
-            @row_content(u)
-            def yes_or_no_row(u: ILoveUI):
+            with row_ctx(u):
                 text(u, 'no') \
                     .flex() \
                     .expend_xy(20, 20) \
@@ -1604,7 +1533,7 @@ def dialog(
                     .expend_xy(20, 20) \
                     .clickable(highlight, lambda _: chosen(True))
 
-        top_column \
+        u.last \
             .background(Color(80, 80, 80)) \
             .animated_rect(popup_state / 'animated_rect') \
             .align_xy(0.5, 0.5) \
@@ -1621,7 +1550,7 @@ def def_window(
     with_close_button: bool = True,
     close_layer: bool = False,
     single_window_key: UIPath | None = None,
-):
+) -> Callable:
     def decorator(content: Callable[[ILoveUI, PopupContext], None]) -> Callable[[ILoveUI], None]:
         def open_window(u: ILoveUI) -> None:
             window(u, content, initial_x, initial_y, layout, with_close_button, close_layer, single_window_key)
@@ -3064,7 +2993,7 @@ class PygameILoveUIRenderer(Renderer):
         self.screen_surface = screen_surface
         self.buffer_surface = pygame.Surface(screen_surface.get_size(), pygame.SRCALPHA)
 
-        self.scissor_stack: list[Rect] = []
+        self.scissor_stack: list[tuple[Rect, bool]] = []
         self.scissor_enabled = True
 
         self.font = pygame.font.SysFont(['SimHei', 'Arial'], 24)
@@ -3123,13 +3052,13 @@ class PygameILoveUIRenderer(Renderer):
     def push_scissor(self, rect: Rect, for_render: bool = True) -> None:
         # 计算当前有效裁剪 = 上一层裁剪 ∩ 新矩形
         if self.scissor_stack:
-            last_effective = self.scissor_stack[-1]
+            last_effective, _ = self.scissor_stack[-1]
             effective_rect = last_effective.intersect(rect)
         else:
             effective_rect = rect
 
         # 入栈
-        self.scissor_stack.append(effective_rect)
+        self.scissor_stack.append((effective_rect, for_render))
         # 应用最终裁剪
         if for_render and self.scissor_enabled:
             self.screen_surface.set_clip(effective_rect.to_tuple())
@@ -3144,14 +3073,15 @@ class PygameILoveUIRenderer(Renderer):
         if self.scissor_enabled:
             # 恢复新的栈顶裁剪
             if self.scissor_stack:
-                new_top_effective = self.scissor_stack[-1]
-                self.screen_surface.set_clip(new_top_effective.to_tuple())
+                new_top_effective, for_render = self.scissor_stack[-1]
+                if for_render:
+                    self.screen_surface.set_clip(new_top_effective.to_tuple())
             else:
                 self.screen_surface.set_clip(None)
 
     @property
     def scissor_rect(self) -> Rect | None:
-        return self.scissor_stack[-1] if self.scissor_stack else None
+        return self.scissor_stack[-1][0] if self.scissor_stack else None
 
     def get_scissor_count(self) -> int:
         return len(self.scissor_stack)
@@ -3163,7 +3093,7 @@ class PygameILoveUIRenderer(Renderer):
         self.scissor_enabled = value
         if value:
             if self.scissor_stack:
-                new_top_effective = self.scissor_stack[-1]
+                new_top_effective, _ = self.scissor_stack[-1]
                 self.screen_surface.set_clip(new_top_effective.to_tuple())
         else:
             self.screen_surface.set_clip(None)
@@ -3568,8 +3498,6 @@ class FastDebug:
                     .flex() \
                     .tag_up(u, 'show v-finger', id / 'show v finger checkbox tag', text_color=checkbox_text_color)
 
-        popup_layer(u)
-
         if self.show_v_finger:
             self.v_finger.v_finger(u)
 
@@ -3629,8 +3557,16 @@ class FastDebug:
             .background(color_ref.value)
 
 
-def fast_debug(target_ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
+def fast_debug(target_ui: Callable[[ILoveUI, FastStartContext], None], with_popup_layer: bool = True) -> None:
     state: FastDebug | None = None
+
+    if with_popup_layer:
+        old = target_ui
+        def new(u: ILoveUI, ctx: FastStartContext):
+            popup_layer(u)
+            old(u, ctx)
+
+        target_ui = new
 
     def fast_debug_ui(u: ILoveUI, ctx: FastStartContext) -> None:
         nonlocal state
@@ -3657,7 +3593,6 @@ class FastStart:
 
         if not ctx.fingers:
             ctx.fingers.append(Finger(0, 0))
-
 
 
     def handle_pygame_event(self, e: pygame.event.Event):
@@ -3711,7 +3646,6 @@ class FastStart:
             ctx.event_manager.send_event(KeyEvent, KeyEvent(e.key, e.scancode, e.unicode, False))
 
 
-
     def tick(self) -> None:
         ctx = self.ctx
 
@@ -3723,7 +3657,15 @@ class FastStart:
 
 
 
-def fast_start(ui: Callable[[ILoveUI, FastStartContext], None]) -> None:
+def fast_start(ui: Callable[[ILoveUI, FastStartContext], None], with_popup_layer: bool = True) -> None:
+    if with_popup_layer:
+        old = ui
+        def new(u: ILoveUI, ctx: FastStartContext):
+            popup_layer(u)
+            old(u, ctx)
+
+        ui = new
+
     running = True
 
     # pygame初始化
@@ -3781,8 +3723,7 @@ class WidgetNode:
             text(u, self.widget_value, color=tree_ui.style.widget_text) \
                 .background(tree_ui.style.widget_bg)
 
-            @row_content(u)
-            def args_row(u: ILoveUI):
+            with row_ctx(u):
                 text(u, 'args: ', color=tree_ui.style.widget_text) \
                     .background(tree_ui.style.widget_bg)
 
@@ -3973,8 +3914,7 @@ class VisualEditor:
             .expend_xy(40, 0)
 
     def visual_editor_ui(self, u: ILoveUI) -> Modifying:
-        @row_content(u)
-        def top_row(u: ILoveUI):
+        with row_ctx(u):
 
             self.tree.visual_tree_content_ui(u) \
                 .v_scroll(self.id / 'tree v_scroll') \
@@ -3986,7 +3926,7 @@ class VisualEditor:
                 .h_scroll(self.id / 'code h_scroll') \
                 .flex()
 
-        return top_row
+        return u.last
 
 
 
@@ -4076,8 +4016,7 @@ def open_window_button(u: ILoveUI, id: UIPath) -> Modifying:
             def window_box(u: ILoveUI):
                 window_close_button(u, close_window)
 
-                @column_content(u)
-                def window_column(u: ILoveUI):
+                with column_ctx(u):
                     text(u, 'hello window') \
                         .expend_xy(80, 80)
 
@@ -4165,8 +4104,6 @@ class TestUIState:
 
 def test_screen_content(u: ILoveUI, fps: float):
     test_ui_state = u.context.remember(TestUIState, TestUIState)
-
-    popup_layer(u)
 
     test_animation_button(u, test_ui_state.ui_root / 'test_animation_button') \
         .expend_xy(40, 40) \
@@ -4279,12 +4216,10 @@ def main():
         test_screen_content(u, ctx.fps)
 
     def visual_editor(u: ILoveUI, _: FastStartContext):
-        popup_layer(u)
         v.visual_editor_ui(u)
 
     def choice_ui(u: ILoveUI, ctx: FastStartContext):
-        @column_content(u)
-        def choice_col(u: ILoveUI):
+        with column_ctx(u):
             text(u, 'visual_editor').clickable(highlight, lambda _: set_ui(visual_editor))
             text(u, 'test screen').clickable(highlight, lambda _: set_ui(test_screen_ui))
 
