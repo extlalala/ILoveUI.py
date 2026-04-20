@@ -380,6 +380,7 @@ class Finger:
     """触摸/鼠标指针"""
     x: float
     y: float
+    button: int = pygame.BUTTON_LEFT
 
     drag_listeners: list[Callable[['Finger'], None]] = field(default_factory=lambda: [])
     release_listeners: list[Callable[['Finger'], None]] = field(default_factory=lambda: [])
@@ -450,7 +451,24 @@ class ScrollEvent:
     scroll_x: float
     scroll_y: float
 
-    def in_rect(self, ctx: 'PlaceContext', check_scissor_rect: bool) -> bool:
+    @staticmethod
+    def scrolled(ctx: 'PlaceContext') -> tuple[float, float]:
+        scrolled_x, scrolled_y = 0, 0
+
+        def consume_event(e: ScrollEvent) -> bool:
+            nonlocal scrolled_x, scrolled_y
+
+            in_rect = e.in_rect(ctx)
+            if in_rect:
+                scrolled_x += e.scroll_x
+                scrolled_y += e.scroll_y
+            return in_rect
+
+        ctx.context.event_manager.consume_events(ScrollEvent, consume_event)
+
+        return scrolled_x, scrolled_y
+
+    def in_rect(self, ctx: 'PlaceContext', check_scissor_rect: bool = True) -> bool:
         return ((not check_scissor_rect or ctx.context.renderer.contains_point(self.mouse_x, self.mouse_y)) and
                 ctx.rect.contains_point(self.mouse_x, self.mouse_y))
 
@@ -759,6 +777,7 @@ class Modifying:
         def place_fn(ctx: PlaceContext):
             if not touch_through:
                 ctx.context.event_manager.consume_events(NewFingerEvent, lambda e: e.finger.in_rect(ctx, True))
+                ctx.context.event_manager.consume_events(HoveringEvent, lambda e: e.finger.in_rect(ctx, True))
 
             ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, color))
 
@@ -770,28 +789,17 @@ class Modifying:
     def clickable(self, hover_color: Color | None, click_callback: Callable[[Finger], None], background_color: Color | None = None, check_scissor_rect: bool = True) -> Self:
         p = self.placeable
         def place_fn(ctx: PlaceContext):
-            def consume_new_finger_event(e: NewFingerEvent) -> bool:
-                in_rect = e.finger.in_rect(ctx, check_scissor_rect)
 
-                if in_rect:
-                    def finger_release_listener(finger):
-                        if finger.in_rect(ctx, check_scissor_rect):
-                            click_callback(finger)
+            @NewFingerEvent.consume_events(ctx)
+            def consume_new_finger_event(e: NewFingerEvent):
 
-                    e.finger.on_release(finger_release_listener)
+                @e.finger.on_release
+                def finger_release_listener(finger):
+                    if finger.in_rect(ctx, check_scissor_rect):
+                        click_callback(finger)
 
-                return in_rect
-
-            ctx.context.event_manager.consume_events(NewFingerEvent, consume_new_finger_event)
-
-            if hover_color is not None:
-                def consume_hovering_event(e: HoveringEvent) -> bool:
-                    in_rect = e.finger.in_rect(ctx, True)
-                    if in_rect:
-                        ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, hover_color)) # type: ignore
-                    return in_rect
-
-                ctx.context.event_manager.consume_events(HoveringEvent, consume_hovering_event)
+            if hover_color is not None and HoveringEvent.is_hovering(ctx):
+                ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, hover_color)) # type: ignore
 
             p.place_fn(ctx)
 
@@ -800,6 +808,10 @@ class Modifying:
 
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
+
+    def onclick(self, click_callback: Callable[[Finger], None] | None = None, hover_color: Color | None = highlight, background_color: Color | None = None):
+        return self.clickable(hover_color, click_callback, background_color) if click_callback else \
+               lambda f: self.clickable(hover_color, f, background_color)
 
     def clickable_background(self, background_color: Color | None, click_callback: Callable[[Finger], None], check_scissor_rect: bool = True) -> Self:
         '''
@@ -810,18 +822,13 @@ class Modifying:
         def place_fn(ctx: PlaceContext):
             p.place_fn(ctx)
 
-            def consume_new_finger_event(e: NewFingerEvent) -> bool:
-                in_rect = e.finger.in_rect(ctx, check_scissor_rect)
+            @NewFingerEvent.consume_events(ctx)
+            def consume_new_finger_event(e: NewFingerEvent):
 
-                if in_rect:
-                    def release_listener(finger):
-                        if e.finger.in_rect(ctx, check_scissor_rect):
-                            click_callback(finger)
-                    e.finger.on_release(release_listener)
-
-                return in_rect
-
-            ctx.context.event_manager.consume_events(NewFingerEvent, consume_new_finger_event)
+                @e.finger.on_release
+                def release_listener(finger):
+                    if e.finger.in_rect(ctx, check_scissor_rect):
+                        click_callback(finger)
 
             if background_color is not None:
                 ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, background_color)) # type: ignore
@@ -832,14 +839,12 @@ class Modifying:
     def on_touchdown(self, touchdown_callback: Callable[[Finger], None], consume_event: bool = False, check_scissor_rect: bool = True) -> Self:
         p = self.placeable
         def place_fn(ctx: PlaceContext):
+
+            @NewFingerEvent.consume_events(ctx)
             def consume_new_finger_event(e: NewFingerEvent) -> bool:
-                in_rect = e.finger.in_rect(ctx, check_scissor_rect)
-                if in_rect:
-                    touchdown_callback(e.finger)
+                touchdown_callback(e.finger)
+                return consume_event
 
-                return consume_event and in_rect
-
-            ctx.context.event_manager.consume_events(NewFingerEvent, consume_new_finger_event)
             p.place_fn(ctx)
 
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
@@ -1201,11 +1206,10 @@ def scroll_modifier(
         ctx.context.event_manager.consume_events(ScrollEvent, consume_scroll_event)
 
         #拖拽
+        @NewFingerEvent.consume_events(ctx)
         def consume_finger(e: NewFingerEvent) -> Literal[False]:
-            in_rect = e.finger.in_rect(ctx, check_scissor_rect)
-            if not in_rect:
-                return False
 
+            @e.finger.on_drag
             def on_drag(f: Finger):
                 f_pos = f.x if horizontal else f.y
                 d = f_pos - state.last_drag
@@ -1213,11 +1217,9 @@ def scroll_modifier(
                 state.velocity = -d / dt
                 state.last_drag = f_pos
 
+            @e.finger.on_release
             def on_release(_):
                 state.dragging = False
-
-            e.finger.on_drag(on_drag)
-            e.finger.on_release(on_release)
 
             state.dragging = True
             state.drag_start = e.finger.x if horizontal else e.finger.y
@@ -1225,8 +1227,6 @@ def scroll_modifier(
             state.drag_start_scroll = state.scroll
 
             return False # 不消耗事件
-
-        ctx.context.event_manager.consume_events(NewFingerEvent, consume_finger)
 
         if horizontal:
             content_rect = Rect(
@@ -2056,6 +2056,28 @@ def focusable_modifier(u: ILoveUI, focus_key: Any, p: Placeable, on_focus: Calla
 
 # ==================== widgets ====================
 
+def grids_ui(
+    u: ILoveUI,
+    width: int, height: int,
+    render_item: Callable[[ILoveUI, int, int], Modifying],
+    ratio_x: int = 1, ratio_y: int = 1
+) -> Modifying:
+
+    with column_ctx(u):
+
+        for y in range(height):
+
+            with row_ctx(u):
+
+                for x in range(width):
+                    render_item(u, x, y).flex()
+
+            u.last.flex()
+
+    return u.last.ratio_pad(width * ratio_x, height * ratio_y)
+
+
+
 def spacing_copy_size(u: ILoveUI, copy_size_from: Modifying) -> Modifying:
     return spacing(u, copy_size_from.placeable.min_width, copy_size_from.placeable.min_height)
 
@@ -2472,7 +2494,8 @@ def number_input(u: ILoveUI, name_tag: str, value_ref: Ref, value_text_min_width
 
         text(u, str(value_ref.value)) \
             .min_size_xy(value_text_min_width, 0) \
-            .tag_left(u, name_tag, with_spacing=False)
+            .tag_left(u, name_tag, with_spacing=False) \
+            .flex()
 
         number_modify_button(u, '>', 1)
 
@@ -3557,30 +3580,36 @@ class FastDebug:
             .background(color_ref.value)
 
 
-def fast_debug(target_ui: Callable[[ILoveUI, FastStartContext], None], with_popup_layer: bool = True) -> None:
-    state: FastDebug | None = None
+def fast_debug(target_ui: Callable[[ILoveUI, FastStartContext], None] | None = None, with_popup_layer: bool = True) -> Callable:
 
-    if with_popup_layer:
-        old = target_ui
-        def new(u: ILoveUI, ctx: FastStartContext):
-            popup_layer(u)
-            old(u, ctx)
+    def decorator(target_ui: Callable[[ILoveUI, FastStartContext], None]) -> Callable[[ILoveUI, FastStartContext], None]:
+        state: FastDebug | None = None
 
-        target_ui = new
+        if with_popup_layer:
+            old = target_ui
+            def new(u: ILoveUI, ctx: FastStartContext):
+                popup_layer(u)
+                old(u, ctx)
 
-    def fast_debug_ui(u: ILoveUI, ctx: FastStartContext) -> None:
-        nonlocal state
-        # todo 渲染剪刀区域 [ ]
-        # todo 可视化低代码编辑器 [ ]
+            target_ui = new
 
-        if state is None:
-            target_ui_u = ILoveUI(ILoveUIContext(u.context.renderer))
-            state = FastDebug(UIRendererUIState(ctx, target_ui, target_ui, target_ui_u))
+        def fast_debug_ui(u: ILoveUI, ctx: FastStartContext) -> None:
+            nonlocal state
+            # todo 渲染剪刀区域 [ ]
+            # todo 可视化低代码编辑器 [ ]
 
-        state.ui_renderer_ui_state.fast_start_ctx = ctx
-        state.fast_debug_ui(u)
+            if state is None:
+                target_ui_u = ILoveUI(ILoveUIContext(u.context.renderer))
+                state = FastDebug(UIRendererUIState(ctx, target_ui, target_ui, target_ui_u))
 
-    fast_start(fast_debug_ui)
+            state.ui_renderer_ui_state.fast_start_ctx = ctx
+            state.fast_debug_ui(u)
+
+        fast_start(fast_debug_ui)
+
+        return target_ui
+
+    return decorator(target_ui) if target_ui else decorator
 
 # ==================== fast start ====================
 
@@ -3612,7 +3641,7 @@ class FastStart:
         elif e.type == pygame.MOUSEBUTTONDOWN:
             if e.button != 4 and e.button != 5: # 排除滚轮事件
                 x, y = e.pos
-                finger = Finger(x, y)
+                finger = Finger(x, y, e.button)
                 if len(ctx.fingers) > 0:
                     ctx.fingers[0] = finger
                 else:
