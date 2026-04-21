@@ -594,6 +594,12 @@ class Rect:
 
         return Rect(inter_x, inter_y, inter_w, inter_h)
 
+    def overlaps(self, other: 'Rect') -> bool:
+        return self.x < other.x + other.w and \
+               self.y < other.y + other.h and \
+               other.x < self.x + self.w and \
+               other.y < self.y + self.h
+
 
 
 class Renderer(ABC):
@@ -809,9 +815,9 @@ class Modifying:
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
 
-    def onclick(self, click_callback: Callable[[Finger], None] | None = None, hover_color: Color | None = highlight, background_color: Color | None = None):
+    def onclick(self, click_callback: Callable[[Finger], None] | None = None, hover_color: Color | None = highlight, background_color: Color | None = None) -> Callable:
         return self.clickable(hover_color, click_callback, background_color) if click_callback else \
-               lambda f: self.clickable(hover_color, f, background_color)
+               lambda f: self.clickable(hover_color, f, background_color) # type: ignore
 
     def clickable_background(self, background_color: Color | None, click_callback: Callable[[Finger], None], check_scissor_rect: bool = True) -> Self:
         '''
@@ -994,6 +1000,14 @@ class Modifying:
 
         self.placeable = Placeable(p.min_width, p.min_height, place_fn)
         return self
+
+    def ratio_measure(self, id: UIPath, ratio_x: int, ratio_y: int) -> Self:
+
+        def measure(w: float, h: float) -> tuple[float, float]:
+            unit = min(w / ratio_x, h / ratio_y)
+            return ratio_x * unit, ratio_y * unit
+
+        return self.measure(id, measure)
 
     def square_expend(self) -> Self:
         p = self.placeable
@@ -1298,6 +1312,8 @@ class EventManager:
             return
         self.event_by_type[type] = [e for e in events if not consume(e)]
 
+
+
 class TypeValueMap:
     def __init__(self) -> None:
         self.instance_by_type: dict[type, Any] = {}
@@ -1316,6 +1332,8 @@ class TypeValueMap:
         instance = calc()
         self.instance_by_type[cls_as_key] = instance
         return instance
+
+
 
 class ILoveUIContext:
     def __init__(self, renderer: Renderer) -> None:
@@ -1925,6 +1943,19 @@ def column_ctx(u: ILoveUI, spacing: float = 4):
 
     linear_layout(u, horizontal=False, spacing=spacing, children=inner)
 
+@contextmanager
+def linear_ctx(u: ILoveUI, horizontal: bool, spacing: float = 4):
+    upper = u.children
+    inner = []
+
+    try:
+        u.children = inner
+        yield
+    finally:
+        u.children = upper
+
+    linear_layout(u, horizontal=horizontal, spacing=spacing, children=inner)
+
 def row_content(u: ILoveUI, spacing: float = 4) -> Callable[[Callable[[ILoveUI], None]], Modifying]:
     def decorator(content: Callable[[ILoveUI], None]) -> Modifying:
         return row(u, content, spacing=spacing)
@@ -2055,6 +2086,49 @@ def focusable_modifier(u: ILoveUI, focus_key: Any, p: Placeable, on_focus: Calla
     return Placeable(p.min_width, p.min_height, place_fn)
 
 # ==================== widgets ====================
+
+@dataclass(slots=True)
+class Stage:
+    viewport_w: float
+    viewport_h: float
+    camera_x: float
+    camera_y: float
+
+    def size_screen_to_local(self, value: float) -> float:
+        ...
+
+    def size_local_to_screen(self, value: float) -> float:
+        ...
+
+    def coord_screen_to_local(self, x: float, y: float) -> tuple[float, float]:
+        ...
+
+    def coord_local_to_screen(self, x: float, y: float) -> tuple[float, float]:
+        ...
+
+    def rect_screen_to_local(self, rect: Rect) -> Rect:
+        ...
+
+    def rect_local_to_screen(self, rect: Rect) -> Rect:
+        ...
+
+    @contextmanager
+    def in_stage(self, u: ILoveUI):
+        upper = u.children
+        inner = []
+
+        try:
+            u.children = inner
+            yield
+        finally:
+            u.children = upper
+
+        for ui in inner:
+            ui.map_rect(self.rect_local_to_screen)
+
+        box_layout(u, inner)
+
+
 
 def grids_ui(
     u: ILoveUI,
@@ -2639,7 +2713,7 @@ def manageable_list(
         swap_at = swap
 
     def insert_and_swap_button(u: ILoveUI, idx: int) -> Modifying:
-        def buttons_linear(u: ILoveUI):
+        with linear_ctx(u, not horizontal):
             text(u, '+') \
                 .clickable(highlight, lambda _: insert_at(idx)) # type: ignore
 
@@ -2647,7 +2721,7 @@ def manageable_list(
                 text(u, '<>' if horizontal else '^v') \
                     .clickable(highlight, lambda _: swap_at(idx - 1, idx)) # type: ignore
 
-        return linear(u, not horizontal, 4, buttons_linear)
+        return u.last
 
 
     def enable_if_hover(p: Placeable) -> Placeable:
@@ -2662,7 +2736,7 @@ def manageable_list(
         if remove_at is None:
             return element_ui(u, idx, e)
 
-        def with_remove_button_linear(u: ILoveUI):
+        with linear_ctx(u, not horizontal):
             text(u, '-') \
                 .min_size_xy(12, 0) \
                 .clickable(highlight, lambda _: remove_at(idx)) \
@@ -2670,10 +2744,10 @@ def manageable_list(
 
             element_ui(u, idx, e).flex()
 
-        return linear(u, not horizontal, 4, with_remove_button_linear)
+        return u.last
 
 
-    def elements_linear(u: ILoveUI):
+    with linear_ctx(u, horizontal, item_spacing):
         for i, e in enumerate(lst):
             if insert_at is not None:
                 insert_and_swap_button(u, i) \
@@ -2687,7 +2761,7 @@ def manageable_list(
             if lst:
                 ui.modifier(enable_if_hover)
 
-    return linear(u, horizontal=horizontal, spacing=item_spacing, content=elements_linear)
+    return u.last
 
 
 
