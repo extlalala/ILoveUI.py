@@ -1,5 +1,6 @@
 import array
 import dataclasses
+import math
 import pygame
 import random
 import time
@@ -676,6 +677,13 @@ class Placeable:
     min_width: float
     min_height: float
     place_fn: Callable[[PlaceContext], None]
+    measure: Callable[[float | None, float | None], 'Placeable'] | None = None
+
+    def copy(
+        self,
+        **kwargs
+    ) -> 'Placeable':
+        return dataclasses.replace(self, **kwargs)
 
 @dataclass(slots=True)
 class Modifying:
@@ -686,6 +694,10 @@ class Modifying:
     '''
     placeable: Placeable
     flex_weight: int = 0
+
+    def do_measure(self, w: float | None, h: float | None):
+        if self.placeable.measure:
+            self.placeable = self.placeable.measure(w, h)
 
     @classmethod
     def all_builtin_modifiers(cls) -> Iterable[str]:
@@ -733,7 +745,7 @@ class Modifying:
         p = self.placeable
         def place_fn(ctx: PlaceContext):
             p.place_fn(PlaceContext(rect, ctx.context, ctx.deferred_render_tick_listeners))
-        self.placeable = Placeable(component_min_width, component_min_height, place_fn)
+        self.placeable = p.copy(min_width=component_min_width, min_height=component_min_height, place_fn=place_fn)
         return self
 
     @modifier_def()
@@ -743,14 +755,14 @@ class Modifying:
             off = ctx.rect
             new_rect = Rect(rect.x + off.x, rect.y + off.y, rect.w, rect.h)
             p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
-        self.placeable = Placeable(component_min_width, component_min_height, place_fn)
+        self.placeable = p.copy(min_width=component_min_width, min_height=component_min_height, place_fn=place_fn)
         return self
 
     def map_rect(self, mapper: Callable[[Rect], Rect], component_min_width: float = 10, component_min_height: float = 10) -> Self:
         p = self.placeable
         def place_fn(ctx: PlaceContext):
             p.place_fn(PlaceContext(mapper(ctx.rect), ctx.context, ctx.deferred_render_tick_listeners))
-        self.placeable = Placeable(component_min_width, component_min_height, place_fn)
+        self.placeable = p.copy(min_width=component_min_width, min_height=component_min_height, place_fn=place_fn)
         return self
 
     def debug_print_rect(self, name: str = 'debug') -> Self:
@@ -761,7 +773,7 @@ class Modifying:
             print(f'[{name}] {min_size=}, {ctx.rect=}')
             p.place_fn(ctx)
 
-        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        self.placeable = p.copy(place_fn=place_fn)
         return self
 
     def background(self, color: Color, touch_through: bool = False) -> Self:
@@ -775,7 +787,7 @@ class Modifying:
 
             ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, color))
 
-        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        self.placeable = p.copy(place_fn=place_fn)
         return self
 
     def foreground(self, color: Color, touch_through: bool = True) -> Self:
@@ -789,7 +801,7 @@ class Modifying:
 
             p.place_fn(ctx)
 
-        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        self.placeable = p.copy(place_fn=place_fn)
         return self
 
     def clickable(self, hover_color: Color | None, click_callback: Callable[[Finger], None], background_color: Color | None = None, check_scissor_rect: bool = True) -> Self:
@@ -812,7 +824,7 @@ class Modifying:
             if background_color is not None:
                 ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, background_color)) # type: ignore
 
-        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        self.placeable = p.copy(place_fn=place_fn)
         return self
 
     def onclick(self, click_callback: Callable[[Finger], None] | None = None, hover_color: Color | None = highlight, background_color: Color | None = None) -> Callable:
@@ -839,7 +851,7 @@ class Modifying:
             if background_color is not None:
                 ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, background_color)) # type: ignore
 
-        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        self.placeable = p.copy(place_fn=place_fn)
         return self
 
     def on_touchdown(self, touchdown_callback: Callable[[Finger], None], consume_event: bool = False, check_scissor_rect: bool = True) -> Self:
@@ -853,7 +865,7 @@ class Modifying:
 
             p.place_fn(ctx)
 
-        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        self.placeable = p.copy(place_fn=place_fn)
         return self
 
     def tag_up(self, u: 'ILoveUI', tag_str: str, id: UIPath | None = None, text_color: Color = white) -> Self:
@@ -904,8 +916,8 @@ class Modifying:
 
             mw = max(tag_left_ui.placeable.min_width, tag_right_ui.placeable.min_width)
             mh = max(tag_left_ui.placeable.min_height, tag_right_ui.placeable.min_height)
-            tag_left_ui.placeable = Placeable(mw, mh, tag_left_ui.placeable.place_fn)
-            tag_right_ui.placeable = Placeable(mw, mh, tag_right_ui.placeable.place_fn)
+            tag_left_ui.placeable = tag_left_ui.placeable.copy(min_width=mw, min_height=mh)
+            tag_right_ui.placeable = tag_right_ui.placeable.copy(min_width=mw, min_height=mh)
 
         self.placeable = u.context.to_placeable(row_content, row)
         return self
@@ -924,7 +936,7 @@ class Modifying:
             ctx.deferred_render_tick(render)
             p.place_fn(ctx)
 
-        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        self.placeable = p.copy(place_fn=place_fn)
         return self
 
     def memo_max_size(self, id: UIPath) -> Self:
@@ -963,7 +975,7 @@ class Modifying:
 
             p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
 
-        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        self.placeable = p.copy(place_fn=place_fn)
         return self
 
     def expend_xy(self, expend_x: float, expend_y: float) -> Self:
@@ -998,23 +1010,33 @@ class Modifying:
             new_rect = ctx.rect.sub_rect_with_align(w, h, 0.5, 0.5)
             p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
 
-        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        self.placeable = p.copy(place_fn=place_fn)
         return self
 
-    def ratio_measure(self, id: UIPath, ratio_x: int, ratio_y: int) -> Self:
+    def ratio_measure(self, ratio_x: int, ratio_y: int) -> Self:
 
-        def measure(w: float, h: float) -> tuple[float, float]:
-            unit = min(w / ratio_x, h / ratio_y)
+        def measure(w: float | None, h: float | None) -> tuple[float, float]:
+            inf = math.inf
+            unit = min(inf if w is None else w / ratio_x , inf if h is None else h / ratio_y)
             return ratio_x * unit, ratio_y * unit
 
-        return self.measure(id, measure)
+        return self.measure(measure)
+
+    def measure(self, measure_fn: Callable[[float | None, float | None], tuple[float, float]]) -> Self:
+        p = self.placeable
+        def measure(w: float | None, h: float | None) -> Placeable:
+            nw, nh = measure_fn(w, h)
+            return p.copy(min_width=nw, min_height=nh)
+
+        self.placeable = p.copy(measure=measure)
+        return self
 
     def square_expend(self) -> Self:
         p = self.placeable
 
         size = max(p.min_width, p.min_height)
 
-        self.placeable = Placeable(size, size, p.place_fn)
+        self.placeable = p.copy(min_width=size, min_height=size)
         return self
 
     def square_pad(self) -> Self:
@@ -1025,7 +1047,7 @@ class Modifying:
             new_rect = ctx.rect.sub_rect_with_align(size, size, 0.5, 0.5)
             p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
 
-        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        self.placeable = p.copy(place_fn=place_fn)
         return self
 
     def padding_xy(self, padding_x: float, padding_y: float) -> Self:
@@ -1046,7 +1068,7 @@ class Modifying:
                 align_y if align_y is not None else 0
             )
             p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
-        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        self.placeable = p.copy(place_fn=place_fn)
         return self
 
     def offset_xy(self, offset_x: float | None, offset_y: float | None) -> Self:
@@ -1059,7 +1081,7 @@ class Modifying:
                 offset_y if offset_y is not None else 0
             )
             p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
-        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        self.placeable = p.copy(place_fn=place_fn)
         return self
 
     def get_rect(self, out_rect: Callable[[Rect], None]) -> Self:
@@ -1067,7 +1089,7 @@ class Modifying:
         def place_fn(ctx: PlaceContext):
             out_rect(ctx.rect)
             p.place_fn(ctx)
-        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        self.placeable = p.copy(place_fn=place_fn)
         return self
 
     def scissor(self) -> Self:
@@ -1080,20 +1102,7 @@ class Modifying:
 
             ctx.context.renderer.pop_scissor() # 用于拦截事件
             ctx.deferred_render_tick(lambda: ctx.context.renderer.push_scissor(ctx.rect), RenderOperateType.scissor_op) # defer 从下到上执行
-        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
-        return self
-
-    def measure(self, id: UIPath, measure_fn: Callable[[float, float], tuple[float, float]]) -> Self:
-        p = self.placeable
-        constraints = id.remember(lambda: [p.min_width, p.min_height])
-
-        def place_fn(ctx: PlaceContext):
-            constraints[0] = ctx.rect.w
-            constraints[1] = ctx.rect.h
-            p.place_fn(ctx)
-
-        w, h = measure_fn(constraints[0], constraints[1]) # type: ignore
-        self.placeable = Placeable(w, h, place_fn)
+        self.placeable = p.copy(place_fn=place_fn)
         return self
 
     def draggable(self, offset: Ref[tuple[float, float]]) -> Self:
@@ -1112,7 +1121,7 @@ class Modifying:
                 def on_drag(finger: Finger):
                     offset.value = (finger.x - offset_x, finger.y - offset_y)
 
-        self.placeable = Placeable(p.min_width, p.min_height, place_fn)
+        self.placeable = p.copy(place_fn=place_fn)
         return self
 
     def scroll(
@@ -1677,7 +1686,7 @@ def window(
 
             ctx.context.event_manager.consume_events(HoveringEvent, consume_hovering_event)
 
-        return Placeable(p.min_width, p.min_height, place_fn)
+        return p.copy(place_fn=place_fn)
 
     if with_close_button:
         old_content = content
@@ -1763,6 +1772,8 @@ class LazyListState:
     scroll_scope: ScrollScope = field(default_factory=ScrollScope)
     scroll_state: ScrollState = field(default_factory=ScrollState)
 
+    min_cross_size: float = 0
+
     def first_item_overflow_size(self) -> float:
         return self.scroll_scope.viewport_offset - self.start_offset
 
@@ -1777,12 +1788,15 @@ def lazy_list_linear(
 
     if state.first_render:
         state.first_render = False
-        def linear_content(u: ILoveUI):
+        with linear_ctx(u, horizontal, list_spacing):
             for i in range(min(LAZY_LIST_TRY_RENDER_COUNT, len(lst))):
                 render_item(u, lst[i])
 
+        ui = u.last
+        state.min_cross_size = ui.placeable.min_height if horizontal else ui.placeable.min_width
+
     else:
-        def linear_content(u: ILoveUI):
+        def linear_content(u: ILoveUI, ctx: PlaceContext):
             idx = clamp(0, state.start_index, len(lst) - 1)
 
             # 必须保证 (1) -> (2) 的顺序
@@ -1791,9 +1805,17 @@ def lazy_list_linear(
 
             pad_head_spacing = spacing(u, state.start_offset, 0) if horizontal else spacing(u, 0, state.start_offset) # (1)
 
+            min_cross_size = 0
+
             if idx >= 1 and state.first_item_overflow_size() < 0: # 列表上有空间时移动元素窗口
                 ui = render_item(u, lst[idx - 1]) # (2)
+                min_cross_size = max(min_cross_size, ui.placeable.min_height if horizontal else ui.placeable.min_width)
+
+                ui.do_measure(None, ctx.rect.h) if horizontal else ui.do_measure(ctx.rect.w, None)
+                ui.placeable.measure = None
+
                 ui_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
+                min_cross_size = max(min_cross_size, ui.placeable.min_height if horizontal else ui.placeable.min_width)
 
                 state.start_offset -= ui_size + list_spacing # (2)
                 state.start_index -= 1
@@ -1807,7 +1829,13 @@ def lazy_list_linear(
                     break
 
                 ui = render_item(u, lst[idx])
+                min_cross_size = max(min_cross_size, ui.placeable.min_height if horizontal else ui.placeable.min_width)
+
+                ui.do_measure(None, ctx.rect.h) if horizontal else ui.do_measure(ctx.rect.w, None)
+                ui.placeable.measure = None
+
                 ui_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
+                min_cross_size = max(min_cross_size, ui.placeable.min_height if horizontal else ui.placeable.min_width)
 
                 if idx < len(lst) - 1 and state.first_item_overflow_size() > ui_size + list_spacing: # 元素被上滑出列表时移动元素窗口
                     state.start_offset += ui_size + list_spacing
@@ -1816,10 +1844,23 @@ def lazy_list_linear(
                 space -= ui_size + list_spacing
                 idx += 1
 
+            state.min_cross_size = min_cross_size
+
             if idx < len(lst):
                 spacing(u, LAZY_LIST_TAIL_SPACING, 0) if horizontal else spacing(u, 0, LAZY_LIST_TAIL_SPACING)
 
-    ui = linear(u, horizontal=horizontal, content=linear_content, spacing=list_spacing)
+        def place_fn(ctx: PlaceContext):
+            child_u = ILoveUI(u.context)
+            linear_content(child_u, ctx)
+            total_flex = 0
+            total_weight = 0
+            for ui in child_u.children:
+                total_weight += ui.flex_weight
+                if ui.flex_weight != 0:
+                    total_flex += ui.placeable.min_width if horizontal else ui.placeable.min_height
+
+            linear_layout_place_fn(ctx, horizontal, list_spacing, total_flex, total_weight, children=child_u.children)
+        ui = u.element(place_fn, 10_0000_0000, state.min_cross_size) if horizontal else u.element(place_fn, state.min_cross_size, 10_0000_0000)
 
     ui.placeable = scroll_modifier(state.scroll_state, ui.placeable, horizontal=horizontal, out_scope=state.scroll_scope)
 
@@ -1985,6 +2026,35 @@ def linear(u: ILoveUI, horizontal: bool, spacing: float, content: Callable[[ILov
     content(child_u)
     return linear_layout(u, horizontal, spacing, children=child_u.children)
 
+def linear_layout_place_fn(ctx: PlaceContext, horizontal: bool, spacing: float, total_flex_size: float, total_weight: float, children: list[Modifying]):
+    weight_to_flex_size_factor = total_flex_size / total_weight if total_weight != 0 else 0
+
+    for ui in children:
+        if ui.placeable.measure: # 如果有 measure 方法, 则先 measure
+            ui.do_measure(None, ctx.rect.h) if horizontal else ui.do_measure(ctx.rect.w, None)
+
+        if ui.flex_weight != 0: # 如果比例分配的大小不够, 转为固定大小
+            flex_size = ui.flex_weight * weight_to_flex_size_factor
+            required_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
+            if flex_size < required_size:
+                total_flex_size -= required_size
+                total_weight -= ui.flex_weight
+                weight_to_flex_size_factor = total_flex_size / total_weight if total_weight != 0 else 0
+                ui.flex_weight = 0
+
+    base = ctx.rect.x if horizontal else ctx.rect.y
+    for ui in children:
+
+        if ui.flex_weight == 0:
+            child_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
+        else:
+            child_size = ui.flex_weight * weight_to_flex_size_factor
+
+        child_rect = Rect(base, ctx.rect.y, child_size, ctx.rect.h) if horizontal else Rect(ctx.rect.x, base, ctx.rect.w, child_size)
+        child_ctx = PlaceContext(child_rect, ctx.context, ctx.deferred_render_tick_listeners)
+        ui.placeable.place_fn(child_ctx)
+        base += child_size + spacing
+
 def linear_layout(u: ILoveUI, horizontal: bool, spacing: float, children: list[Modifying]) -> Modifying:
     min_width = 0
     min_height = 0
@@ -2011,36 +2081,9 @@ def linear_layout(u: ILoveUI, horizontal: bool, spacing: float, children: list[M
         min_height += total_spacing
 
     def place_fn(ctx: PlaceContext):
-        nonlocal fixed_size, total_weight
-
         total_flex_size = ctx.rect.w if horizontal else ctx.rect.h
         total_flex_size -= total_spacing + fixed_size
-
-        weight_to_flex_size_factor = total_flex_size / total_weight if total_weight != 0 else 0
-
-        # 如果比例分配的大小不够, 转为固定大小
-        for ui in children:
-            if ui.flex_weight != 0:
-                flex_size = ui.flex_weight * weight_to_flex_size_factor
-                required_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
-                if flex_size < required_size:
-                    total_flex_size -= required_size
-                    total_weight -= ui.flex_weight
-                    weight_to_flex_size_factor = total_flex_size / total_weight if total_weight != 0 else 0
-                    ui.flex_weight = 0
-
-        base = ctx.rect.x if horizontal else ctx.rect.y
-        for ui in children:
-
-            if ui.flex_weight == 0:
-                child_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
-            else:
-                child_size = ui.flex_weight * weight_to_flex_size_factor
-
-            child_rect = Rect(base, ctx.rect.y, child_size, ctx.rect.h) if horizontal else Rect(ctx.rect.x, base, ctx.rect.w, child_size)
-            child_ctx = PlaceContext(child_rect, ctx.context, ctx.deferred_render_tick_listeners)
-            ui.placeable.place_fn(child_ctx)
-            base += child_size + spacing
+        linear_layout_place_fn(ctx=ctx, horizontal=horizontal, spacing=spacing, total_flex_size=total_flex_size, total_weight=total_weight, children=children)
 
     return u.element(place_fn, min_width=min_width, min_height=min_height)
 
@@ -2083,7 +2126,7 @@ def focusable_modifier(u: ILoveUI, focus_key: Any, p: Placeable, on_focus: Calla
         ctx.context.event_manager.consume_events(NewFingerEvent, consume_new_finger_event)
 
         p.place_fn(ctx)
-    return Placeable(p.min_width, p.min_height, place_fn)
+    return p.copy(place_fn=place_fn)
 
 # ==================== widgets ====================
 
@@ -2349,7 +2392,7 @@ class TextField2:
                 ctx.context.event_manager.consume_events(NewFingerEvent, consume_new_finger_event)
                 p.place_fn(ctx)
 
-            return Placeable(p.min_width, p.min_height, place_fn)
+            return p.copy(place_fn=place_fn)
 
         ui = u.element(place_fn, max(30, self.min_width), max(30, self.min_height))
         ui.placeable = focusable_modifier(u, self.focus_key, ui.placeable)
@@ -2638,7 +2681,7 @@ def touchpad(u: ILoveUI, touchpad_vec: Ref[tuple[float, float]], touchpad_handle
 
             ctx.context.event_manager.consume_events(NewFingerEvent, consume_new_finger_events)
             p.place_fn(ctx)
-        return Placeable(p.min_width, p.min_height, place_fn)
+        return p.copy(place_fn=place_fn)
 
     with box_ctx(u):
         touchpad_handle(u) \
@@ -2729,7 +2772,7 @@ def manageable_list(
             if HoveringEvent.is_hovering(ctx, consume_events=False):
                 p.place_fn(ctx)
 
-        return Placeable(p.min_width, p.min_height, place_fn)
+        return p.copy(place_fn=place_fn)
 
 
     def in_list_element_ui(u: ILoveUI, idx: int, e: T) -> Modifying:
@@ -2786,7 +2829,7 @@ def render_time_text(u: ILoveUI, id: UIPath) -> Modifying:
         def place_fn(ctx: PlaceContext):
             ctx.deferred_render_tick(lambda: state.set_time_seconds(time.time() - time_start))
             p.place_fn(ctx)
-        return Placeable(p.min_width, p.min_height, place_fn)
+        return p.copy(place_fn=place_fn)
 
     return text(u, f'cur: {state.time_seconds:.4f}s, max: {state.max_time_seconds:.4f}s') \
         .modifier(measure_time_modifier) \
@@ -3509,7 +3552,7 @@ class VFinger:
                 if hover:
                     ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, highlight))
 
-            return Placeable(p.min_width, p.min_height, place_fn)
+            return p.copy(place_fn=place_fn)
 
         with row_ctx(u):
             text(u, '<- v finger', color=black)
@@ -4192,7 +4235,7 @@ def test_scroll_ui(u: ILoveUI, id: UIPath) -> Modifying:
     @lazy_list_column_content(u, id / 'lazy column', range(12000000))
     def element_buttons(u: ILoveUI, i: int) -> Modifying:
         return element_button(u, i, element_id / i) \
-            .measure(element_id / 'measure' / i, lambda w, _: (w, w * 0.618))
+            .ratio_measure(1000, 618)
 
     return element_buttons
 
