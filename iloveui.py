@@ -634,7 +634,7 @@ class Renderer(ABC):
         can_render: Callable[[Rect], bool] = field(default=lambda _: True)
 
     @abstractmethod
-    def draw_text(self, text_str: str, color: Color = Color(255, 255, 255)) -> Renderable: ...
+    def draw_text(self, text_str: str, color: Color = Color(255, 255, 255), wrap: bool = True) -> Renderable: ...
 
     @abstractmethod
     def draw_line(
@@ -762,6 +762,15 @@ class Modifying:
         p = self.placeable
         def place_fn(ctx: PlaceContext):
             p.place_fn(PlaceContext(mapper(ctx.rect), ctx.context, ctx.deferred_render_tick_listeners))
+        self.placeable = p.copy(min_width=component_min_width, min_height=component_min_height, place_fn=place_fn)
+        return self
+
+    def map_pos(self, mapper: Callable[[Rect], tuple[float, float]], component_min_width: float = 10, component_min_height: float = 10) -> Self:
+        p = self.placeable
+        def place_fn(ctx: PlaceContext):
+            x, y = mapper(ctx.rect)
+            new_rect = Rect(x, y, p.min_width, p.min_height)
+            p.place_fn(PlaceContext(new_rect, ctx.context, ctx.deferred_render_tick_listeners))
         self.placeable = p.copy(min_width=component_min_width, min_height=component_min_height, place_fn=place_fn)
         return self
 
@@ -1105,21 +1114,34 @@ class Modifying:
         self.placeable = p.copy(place_fn=place_fn)
         return self
 
-    def draggable(self, offset: Ref[tuple[float, float]]) -> Self:
+    def draggable(
+        self,
+        offset: Ref[tuple[float, float]],
+        drag_start: Callable[[Finger], None] | None = None,
+        drag_end: Callable[[Finger], None] | None = None,
+        hover_color: Color | None = highlight
+    ) -> Self:
         p = self.placeable
 
         def place_fn(ctx: PlaceContext):
-            p.place_fn(ctx)
+            if hover_color is not None and HoveringEvent.is_hovering(ctx):
+                ctx.deferred_render_tick(lambda: ctx.context.renderer.fill_rect(ctx.rect, hover_color)) # type: ignore
 
             @NewFingerEvent.consume_events(ctx)
             def consume_new_finger_event(e: NewFingerEvent):
+                if drag_start:
+                    drag_start(e.finger)
+
                 origin_x, origin_y = offset.value
                 offset_x = e.finger.x - origin_x
                 offset_y = e.finger.y - origin_y
 
-                @e.finger.on_drag
-                def on_drag(finger: Finger):
-                    offset.value = (finger.x - offset_x, finger.y - offset_y)
+                e.finger.on_drag(lambda finger: offset.set((finger.x - offset_x, finger.y - offset_y)))
+
+                if drag_end:
+                    e.finger.on_release(drag_end)
+
+            p.place_fn(ctx)
 
         self.placeable = p.copy(place_fn=place_fn)
         return self
@@ -1569,7 +1591,7 @@ def dialog(
 
 
 def def_window(
-    content: Callable[[ILoveUI, PopupContext], None] | None = None,
+    content: Callable[[ILoveUI, PopupContext, *tuple[Any, ...]], None] | None = None,
     *,
     initial_x: float = 100,
     initial_y: float = 200,
@@ -1578,9 +1600,9 @@ def def_window(
     close_layer: bool = False,
     single_window_key: UIPath | None = None,
 ) -> Callable:
-    def decorator(content: Callable[[ILoveUI, PopupContext], None]) -> Callable[[ILoveUI], None]:
-        def open_window(u: ILoveUI) -> None:
-            window(u, content, initial_x, initial_y, layout, with_close_button, close_layer, single_window_key)
+    def decorator(content: Callable[[ILoveUI, PopupContext, *tuple[Any, ...]], None]) -> Callable[[ILoveUI], None]:
+        def open_window(u: ILoveUI, *args, **kwargs) -> None:
+            window(u, lambda u, ctx: content(u, ctx, *args, **kwargs), initial_x, initial_y, layout, with_close_button, close_layer, single_window_key)
         return open_window
 
     return decorator(content) if content else decorator
@@ -1796,6 +1818,7 @@ def lazy_list_linear(
         state.min_cross_size = ui.placeable.min_height if horizontal else ui.placeable.min_width
 
     else:
+        # todo bug 滑到下面时, 如果已滑过的元素大小改变, 会导致记录的 start_offset 和实际不符, 导致把错误的位置视为起点
         def linear_content(u: ILoveUI, ctx: PlaceContext):
             idx = clamp(0, state.start_index, len(lst) - 1)
 
@@ -1852,13 +1875,15 @@ def lazy_list_linear(
         def place_fn(ctx: PlaceContext):
             child_u = ILoveUI(u.context)
             linear_content(child_u, ctx)
-            total_flex = 0
+            total_fixed = 0
             total_weight = 0
             for ui in child_u.children:
                 total_weight += ui.flex_weight
-                if ui.flex_weight != 0:
-                    total_flex += ui.placeable.min_width if horizontal else ui.placeable.min_height
+                if ui.flex_weight == 0:
+                    total_fixed += ui.placeable.min_width if horizontal else ui.placeable.min_height
 
+            total_flex = ctx.rect.w if horizontal else ctx.rect.h
+            total_flex -= total_fixed + max(0, len(child_u.children)) * list_spacing
             linear_layout_place_fn(ctx, horizontal, list_spacing, total_flex, total_weight, children=child_u.children)
         ui = u.element(place_fn, 10_0000_0000, state.min_cross_size) if horizontal else u.element(place_fn, state.min_cross_size, 10_0000_0000)
 
@@ -2026,24 +2051,36 @@ def linear(u: ILoveUI, horizontal: bool, spacing: float, content: Callable[[ILov
     content(child_u)
     return linear_layout(u, horizontal, spacing, children=child_u.children)
 
-def linear_layout_place_fn(ctx: PlaceContext, horizontal: bool, spacing: float, total_flex_size: float, total_weight: float, children: list[Modifying]):
+def linear_layout_place_fn(
+    ctx: PlaceContext,
+    horizontal: bool,
+    spacing: float,
+    total_flex_size: float,
+    total_weight: float,
+    children: list[Modifying],
+    keep_min_size: bool = True
+):
     weight_to_flex_size_factor = total_flex_size / total_weight if total_weight != 0 else 0
 
-    for ui in children:
-        if ui.placeable.measure: # 如果有 measure 方法, 则先 measure
-            ui.do_measure(None, ctx.rect.h) if horizontal else ui.do_measure(ctx.rect.w, None)
+    if keep_min_size:
+        for ui in children:
+            if ui.placeable.measure: # 如果有 measure 方法, 则先 measure
+                ui.do_measure(None, ctx.rect.h) if horizontal else ui.do_measure(ctx.rect.w, None)
 
-        if ui.flex_weight != 0: # 如果比例分配的大小不够, 转为固定大小
-            flex_size = ui.flex_weight * weight_to_flex_size_factor
-            required_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
-            if flex_size < required_size:
-                total_flex_size -= required_size
-                total_weight -= ui.flex_weight
-                weight_to_flex_size_factor = total_flex_size / total_weight if total_weight != 0 else 0
-                ui.flex_weight = 0
+            if ui.flex_weight != 0: # 如果比例分配的大小不够, 转为固定大小
+                flex_size = ui.flex_weight * weight_to_flex_size_factor
+                required_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
+                if flex_size < required_size:
+                    total_flex_size -= required_size
+                    total_weight -= ui.flex_weight
+                    weight_to_flex_size_factor = total_flex_size / total_weight if total_weight != 0 else 0
+                    ui.flex_weight = 0
 
     base = ctx.rect.x if horizontal else ctx.rect.y
     for ui in children:
+
+        if not keep_min_size and ui.placeable.measure: # 如果有 measure 方法, 则先 measure
+            ui.do_measure(None, ctx.rect.h) if horizontal else ui.do_measure(ctx.rect.w, None)
 
         if ui.flex_weight == 0:
             child_size = ui.placeable.min_width if horizontal else ui.placeable.min_height
@@ -2129,47 +2166,6 @@ def focusable_modifier(u: ILoveUI, focus_key: Any, p: Placeable, on_focus: Calla
     return p.copy(place_fn=place_fn)
 
 # ==================== widgets ====================
-
-@dataclass(slots=True)
-class Stage:
-    viewport_w: float
-    viewport_h: float
-    camera_x: float
-    camera_y: float
-
-    def size_screen_to_local(self, value: float) -> float:
-        ...
-
-    def size_local_to_screen(self, value: float) -> float:
-        ...
-
-    def coord_screen_to_local(self, x: float, y: float) -> tuple[float, float]:
-        ...
-
-    def coord_local_to_screen(self, x: float, y: float) -> tuple[float, float]:
-        ...
-
-    def rect_screen_to_local(self, rect: Rect) -> Rect:
-        ...
-
-    def rect_local_to_screen(self, rect: Rect) -> Rect:
-        ...
-
-    @contextmanager
-    def in_stage(self, u: ILoveUI):
-        upper = u.children
-        inner = []
-
-        try:
-            u.children = inner
-            yield
-        finally:
-            u.children = upper
-
-        for ui in inner:
-            ui.map_rect(self.rect_local_to_screen)
-
-        box_layout(u, inner)
 
 
 
@@ -2269,7 +2265,7 @@ class TextField2:
             s = r'\n' if is_new_line else chr(codepoint)
             if self.renderer is None:
                 raise ValueError()
-            glyph = self.renderer.draw_text(s)
+            glyph = self.renderer.draw_text(s, wrap=False)
             self.glyphs[codepoint] = glyph
             self.et.text.line_height = glyph.min_height
 
@@ -2294,7 +2290,7 @@ class TextField2:
                     if not e.isDown:
                         return False
 
-                    if e.keycode == pygame.K_UP: #ttt
+                    if e.keycode == pygame.K_UP:
                         self.et.move_up()
                     elif e.keycode == pygame.K_DOWN:
                         self.et.move_down()
@@ -2627,8 +2623,8 @@ def number_input(u: ILoveUI, name_tag: str, value_ref: Ref, value_text_min_width
 def number_pad(u: ILoveUI, number_typed: Callable[[int], None], id: UIPath | None = None) -> Modifying:
     def number_button(u: ILoveUI, number: int) -> Modifying:
         return text(u, str(number), id = id / number if id is not None else None) \
-            .flex() \
-            .clickable(highlight, lambda _: number_typed(number), background_color=Color(40, 40, 40))
+            .clickable(highlight, lambda _: number_typed(number), background_color=Color(40, 40, 40)) \
+            .flex()
 
     def number_row(u: ILoveUI, n1: int, n2: int, n3: int) -> Modifying:
         with row_ctx(u):
@@ -3169,16 +3165,35 @@ class PygameILoveUIRenderer(Renderer):
             )
 
 
-    def draw_text(self, text_str: str, color: Color = white) -> Renderer.Renderable:
-        surf = self.font.render(text_str, True, color.to_tuple())
-        min_width = surf.get_width()
-        min_height = surf.get_height()
+    def draw_text(self, text_str: str, color: Color = white, wrap: bool = True) -> Renderer.Renderable:
+        if not wrap:
+            surf = self.font.render(text_str, True, color.to_tuple())
+            min_width = surf.get_width()
+            min_height = surf.get_height()
+
+            def render(rect: Rect):
+                # 文本居中绘制
+                blit_x = rect.x + (rect.w - surf.get_width()) / 2
+                blit_y = rect.y + (rect.h - surf.get_height()) / 2
+                self.screen_surface.blit(surf, (blit_x, blit_y))
+
+            return Renderer.Renderable(min_width, min_height, render)
+
+        color_tup = color.to_tuple()
+        lines = [self.font.render(line_str, True, color_tup) for line_str in text_str.splitlines()]
+        if not lines:
+            return Renderer.Renderable(10, 10, lambda _: None)
+
+        min_width = max(surf.get_width() for surf in lines)
+        min_height = sum(surf.get_height() for surf in lines)
 
         def render(rect: Rect):
             # 文本居中绘制
-            blit_x = rect.x + (rect.w - surf.get_width()) / 2
-            blit_y = rect.y + (rect.h - surf.get_height()) / 2
-            self.screen_surface.blit(surf, (blit_x, blit_y))
+            x = rect.x + (rect.w - min_width) / 2
+            y = rect.y + (rect.h - min_height) / 2
+            for surf in lines:
+                self.screen_surface.blit(surf, (x, y))
+                y += surf.get_height()
 
         return Renderer.Renderable(min_width, min_height, render)
 
@@ -3259,7 +3274,7 @@ class RenderLayerMode(Enum):
 
 @dataclass(slots=True)
 class RenderLayerManager:
-    layer: int = 10
+    layer: int = 0
     render_mode: RenderLayerMode = RenderLayerMode.all
     render_mask: bytearray = field(default_factory=lambda: bytearray(b'\xFF' * 512))
     id: UIPath = field(default_factory=UIPath.root)
@@ -3305,7 +3320,7 @@ class RenderLayerManager:
             case _:
                 raise ValueError('unreachable')
 
-def render_layer_control_ui(u: ILoveUI, max_layer: int, state: RenderLayerManager) -> Modifying:
+def render_layer_control_ui(u: ILoveUI, layer_count: int, state: RenderLayerManager) -> Modifying:
     layer = state.layer
 
     def set_layer(value: int) -> None:
@@ -3322,9 +3337,9 @@ def render_layer_control_ui(u: ILoveUI, max_layer: int, state: RenderLayerManage
                 .square_expend() \
                 .clickable(highlight, lambda _: set_layer(layer - 1))
 
-            slider(u, Ref(lambda: layer, lambda value: set_layer(round(value))), 0, max_layer, check_scissor_rect=False) \
+            slider(u, Ref(lambda: layer, lambda value: set_layer(round(value))), 0, layer_count - 1, check_scissor_rect=False) \
                 .flex() \
-                .tag_left_right(u, f'layer: {layer}  ', f'  {max_layer}', tag_min_size=40) \
+                .tag_left_right(u, f'layer: {layer}  ', f'  {layer_count - 1}', tag_min_size=40) \
                 .min_size_xy(280, 0)
 
             text(u, '>') \
@@ -3342,7 +3357,7 @@ def render_layer_control_ui(u: ILoveUI, max_layer: int, state: RenderLayerManage
                 .tag_left(u, 'layer render mode') \
                 .expend_xy(0, 10)
 
-        bitmap_advanced_ui(u, state.id / 'bitmap_ui', state.render_mask, total_bytes_count=max_layer, row_byte_count=12) \
+        bitmap_advanced_ui(u, state.id / 'bitmap_ui', state.render_mask, total_bytes_count=layer_count, row_byte_count=12) \
             .flex() \
             .background(gray)
 
@@ -3611,14 +3626,13 @@ class FastDebug:
             def color_selector_window(u: ILoveUI, ctx: PopupContext):
                 rgba_color_selector(u, color_ref)
 
-        def open_render_layer_window(u: ILoveUI):
-            @window_content(u, single_window_key=id / 'render_layer_window')
-            def render_layer_window(u: ILoveUI, ctx: PopupContext):
-                if self.ui_renderer_ui_state is not None:
-                    max_layer = len(self.ui_renderer_ui_state.cached_render_tick_listeners) if self.ui_renderer_ui_state.cached_render_tick_listeners is not None else 0
-                else:
-                    max_layer = 0
-                render_layer_control_ui(u, max_layer, self.render_layer_manager)
+        @def_window(single_window_key=id / 'render_layer_window')
+        def open_render_layer_window(u: ILoveUI, _):
+            if self.ui_renderer_ui_state is not None:
+                max_layer = len(self.ui_renderer_ui_state.cached_render_tick_listeners) if self.ui_renderer_ui_state.cached_render_tick_listeners is not None else 0
+            else:
+                max_layer = 0
+            render_layer_control_ui(u, max_layer, self.render_layer_manager)
 
         def open_code_window(u: ILoveUI):
             @window_content(u, single_window_key=id / 'code_window')
